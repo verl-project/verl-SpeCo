@@ -444,6 +444,21 @@ class Source:
         clients = [NativeSourceControlClient(**self.connector._native_control_options) for _ in range(2)]
         with ThreadPoolExecutor(max_workers=2) as pool:
             list(pool.map(lambda client: client.validate_published(self.descriptor_value()), clients))
+        actors = [client._private_responses.actor for client in clients]
+        for client in clients:
+            client.close()
+            client.close()
+            assert client._private_responses is None
+        import time
+        for actor in actors:
+            deadline = time.monotonic() + 5
+            while True:
+                try:
+                    ray.get(actor.qsize.remote(), timeout=1)
+                except ray.exceptions.RayActorError:
+                    break
+                assert time.monotonic() < deadline, "Private reply actor survived client.close()"
+                time.sleep(0.05)
     def publish_extra(self): self._publish("filtered")
     def active(self): return len(self.connector._native_source._slots)
     def close(self):

@@ -97,6 +97,7 @@ jobs:
 
       - name: Run all unit and integration tests with torch
         env:
+          SPECO_TEST_REAL_RAY: "1"
           PYTHONPATH: ${{ github.workspace }}:${{ github.workspace }}/.ci/upstream-verl
           VERL_SPECO_UPSTREAM_ROOT: ${{ github.workspace }}/.ci/upstream-verl
         run: >-

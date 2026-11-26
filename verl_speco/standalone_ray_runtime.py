@@ -709,7 +709,15 @@ class StandaloneProducerActor:
             ):
                 raise ValueError("Reference abort has a stale producer incarnation")
             self._abort_reference_state()
-        await self._stop_native_admission()
+        try:
+            await self._stop_native_admission()
+        finally:
+            from verl_speco.transport.native_feature_transport import (
+                NativeSourceDirectoryRouter,
+            )
+
+            if isinstance(self._native_transport, NativeSourceDirectoryRouter):
+                await asyncio.to_thread(self._native_transport.close)
 
     async def _stop_native_admission(self) -> None:
         from verl_speco.transport.native_feature_transport import (

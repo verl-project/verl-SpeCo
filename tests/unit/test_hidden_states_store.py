@@ -498,3 +498,39 @@ class _RecordingPublishStore:
 
     def put_error(self, transfer_manifest, error):
         self.errors.append((transfer_manifest, error))
+
+
+@pytest.mark.parametrize("operation", ["read", "unlink"])
+def test_regular_file_rejects_symlink_and_preserves_target(tmp_path, operation):
+    from verl_speco.regular_file import regular_file, unlink_regular
+    target, link = tmp_path / "target", tmp_path / "link"
+    target.write_bytes(b"keep")
+    try:
+        link.symlink_to(target)
+    except OSError:
+        pytest.skip("Symlinks unavailable")
+    with pytest.raises((OSError, ValueError)):
+        if operation == "read":
+            with regular_file(link) as stream:
+                stream.read()
+        else:
+            unlink_regular(link)
+    assert target.read_bytes() == b"keep"
+
+
+def test_shared_root_replacement_between_validation_and_open_is_rejected(tmp_path, monkeypatch):
+    root = tmp_path / "shared"
+    root.mkdir()
+    reference = root / "sample"
+    reference.write_bytes(b"original")
+    store = FileHiddenStatesStore(str(root), wait_for_writer=False)
+    validate = store.validate_reference
+    def replace_root(value):
+        path = validate(value)
+        root.rename(tmp_path / "original-root")
+        root.mkdir()
+        reference.write_bytes(b"replacement")
+        return path
+    monkeypatch.setattr(store, "validate_reference", replace_root)
+    with pytest.raises(ValueError, match="shared file root changed"):
+        store.load(str(reference))

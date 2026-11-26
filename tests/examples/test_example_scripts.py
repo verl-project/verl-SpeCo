@@ -483,7 +483,9 @@ def test_two_node_failed_reader_shutdown_preserves_source(
     assert stopped == ["reader"]
 
 
-def test_two_node_native_budget_covers_long_samples(two_node_controller, monkeypatch):
+@pytest.mark.parametrize("width,layers", [(4096, 36), (8192, 64)])
+def test_two_node_native_budget_covers_long_samples(two_node_controller, monkeypatch, width, layers):
+    import json
     import io
     import shlex
     from contextlib import contextmanager, nullcontext
@@ -500,7 +502,8 @@ def test_two_node_native_budget_covers_long_samples(two_node_controller, monkeyp
     client = SimpleNamespace(
         open_sftp=lambda: nullcontext(SimpleNamespace(open=write_remote))
     )
-    monkeypatch.setattr(two_node_controller, "execute", lambda *args: None)
+    monkeypatch.setattr(two_node_controller, "execute",
+        lambda *args: json.dumps({"num_hidden_layers": layers,"hidden_size": width,"torch_dtype":"bfloat16"}))
     args = SimpleNamespace(
         root="/jobs",
         repo="/repo",
@@ -519,9 +522,32 @@ def test_two_node_native_budget_covers_long_samples(two_node_controller, monkeyp
     )
     # Full 8k Qwen3-8B capture (five auxiliary layers + final layer), token IDs,
     # and conservative space for both aligned payload and validity registrations.
-    payload_bytes = 8192 * 4096 * 6 * 2 + 8192 * 8
+    payload_bytes = 8192 * width * 6 * 2 + 8192 * 8
+    assert json.loads(env["VLLM_AUX_HIDDEN_STATE_LAYER_IDS"])[-1] == layers - 3
     registered_bytes = payload_bytes + 4 * 1024**2
     assert int(env["SPECO_NATIVE_READER_MAX_BYTES"]) >= registered_bytes
     assert int(env["SPECO_NATIVE_SOURCE_MAX_BYTES"]) >= (
         int(env["SPECO_NATIVE_SOURCE_MAX_SLOTS"]) * registered_bytes
     )
+
+
+def test_two_node_ray_temp_is_unique_and_cleaned(tmp_path):
+    import os
+    import shutil
+    import subprocess
+    bash = shutil.which("bash")
+    if bash is None:
+        pytest.skip("bash unavailable")
+    source = (Path(__file__).resolve().parents[2] / "tools/dspark_two_node/ray.sh").read_text()
+    # Exercise the real temp-directory lifecycle without starting a Ray service.
+    source = source.replace("python3 -c 'from ray.scripts.scripts import main; main()' start", "true")
+    (tmp_path / "job.env").write_text("\n".join([
+        "SPECO_NATIVE_RUN_ID=speco-ci-reuse", "ROLE=consumer",
+        "HOST_IP=127.0.0.1", "CONSUMER_NPU=0", "",
+    ]))
+    paths = []
+    for _ in range(2):
+        subprocess.run([bash, "-c", source], cwd=tmp_path, check=True, env=os.environ.copy())
+        paths.append((tmp_path / "ray.tmp").read_text().strip())
+    assert paths[0] != paths[1]
+    assert all(not Path(path).exists() for path in paths)

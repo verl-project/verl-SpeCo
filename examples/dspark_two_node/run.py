@@ -208,12 +208,24 @@ def check(client, args, role):
 def prepare(client, args, role, name, token, generation):
     directory = f"{args.root}/{name}-{role}"
     execute(client, f"umask 077; mkdir {shlex.quote(directory)}")
-    source_slots, reader_bytes = 4, 512 << 20
+    model_config = json.loads(execute(client, "cat " + shlex.quote(args.model + "/config.json")))
+    model_config = model_config.get("text_config", model_config)
+    layers, width = int(model_config["num_hidden_layers"]), int(model_config["hidden_size"])
+    if layers < 5 or width <= 0:
+        raise ValueError("The DSpark example requires at least five target layers and a positive hidden size")
+    layer_ids = [1 + i * (layers - 4) // 4 for i in range(5)]
+    dtype_bytes = 4 if model_config.get("torch_dtype", model_config.get("dtype")) == "float32" else 2
+    alignment = 2 << 20
+    payload_bytes = 8192 * (width * (len(layer_ids) + 1) * dtype_bytes + 8) + (4 << 20)
+    reuse_bytes = ((payload_bytes + alignment - 1) // alignment) * alignment
+    source_slots, reader_bytes = 4, reuse_bytes + alignment - 1
     variables = {
         "ROLE": role,
         "RUN_DIR": directory,
         "REPO": args.repo,
         "MODEL": args.model,
+        "VLLM_AUX_HIDDEN_STATE_LAYER_IDS": json.dumps(layer_ids),
+        "SPECO_TARGET_NUM_HIDDEN_LAYERS": str(layers),
         "HOST_IP": str(getattr(args, role)),
         "PRODUCER_IP": str(args.producer),
         "CONSUMER_NPU": str(args.consumer_npu),
@@ -230,11 +242,11 @@ def prepare(client, args, role, name, token, generation):
         "SPECO_NATIVE_READER_ENDPOINTS": json.dumps([f"{args.consumer}:25503"]),
         "SPECO_NATIVE_METADATA_SERVER": f"http://{args.consumer}:25501/metadata",
         "SPECO_NATIVE_SOURCE_MAX_SLOTS": str(source_slots),
-        # 8192 tokens x 4096 hidden width x 6 BF16 layers need 384 MiB,
-        # before token IDs, descriptors and registration alignment.
+        # Cover the full 8k capture at this model's width and dtype,
+        # including token IDs, descriptors and registration alignment.
         "SPECO_NATIVE_SOURCE_MAX_BYTES": str(source_slots * reader_bytes),
         "SPECO_NATIVE_READER_MAX_BYTES": str(reader_bytes),
-        "SPECO_NATIVE_REUSE_BUFFER_BYTES": str(448 << 20),
+        "SPECO_NATIVE_REUSE_BUFFER_BYTES": str(reuse_bytes),
         "SPECO_NATIVE_CHUNK_BYTES": str(128 << 20),
         "SPECO_NATIVE_MAX_RECORDS": "128",
         "MC_LEGACY_RPC_PORT_BINDING": "1",
@@ -365,7 +377,7 @@ def main():
         help="same absolute path to this checkout on both hosts",
     )
     parser.add_argument(
-        "--model", required=True, help="Qwen3-8B model path on both hosts"
+        "--model", required=True, help="Target model path on both hosts"
     )
     parser.add_argument(
         "--data",

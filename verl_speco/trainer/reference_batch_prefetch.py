@@ -122,6 +122,14 @@ def _node_frame_batch(
     return batch, seconds
 
 
+def _node_worker_alive(pid):
+    try:
+        with open(f"/proc/{pid}/stat") as stream:
+            return stream.read().rpartition(") ")[2].split()[0] not in {"Z", "X"}
+    except (OSError, IndexError):
+        return False
+
+
 class ReferenceBatchPrefetchIterator(StandalonePrefetchIterator):
     """Dispatch up to depth batches without waiting for previous preparation.
 
@@ -169,6 +177,7 @@ class ReferenceBatchPrefetchIterator(StandalonePrefetchIterator):
         self._pool_shutdown_thread = None
         self._pool_shutdown_error = None
         self._pending: deque[Any] = deque()
+        self._active_result: Any = None
         self.defer_cleanup = defer_cleanup
         self._assignments_done = False
         # Set defaults before spawn imports torch/numpy in the child. Existing
@@ -186,10 +195,12 @@ class ReferenceBatchPrefetchIterator(StandalonePrefetchIterator):
                 max_batch_host_bytes,
             ),
         )
-        self._node_worker_pid = (
-            int(self._pool._pool[0].pid) if node_ranks_per_host else 0
-        )
         try:
+            self._node_worker_pid = (
+                self._pool.apply_async(os.getpid).get(timeout=close_timeout)
+                if node_ranks_per_host
+                else 0
+            )
             super().__init__(
                 loader,
                 depth,
@@ -326,15 +337,17 @@ class ReferenceBatchPrefetchIterator(StandalonePrefetchIterator):
                     if self.stop.is_set() or not self._pending:
                         return
                     assignment, result = self._pending.popleft()
+                    self._active_result = result
                 deadline = time.monotonic() + self.close_timeout
                 while not self.stop.is_set():
                     try:
                         prepared, seconds = result.get(timeout=0.1)
+                        self._active_result = None
                         break
                     except PoolTimeout:
                         if self.node_ranks_per_host and (
-                            self._pool._pool[0].pid != self._node_worker_pid
-                            or self._pool._pool[0].exitcode is not None
+                            self._node_worker_pid is not None
+                            and not _node_worker_alive(self._node_worker_pid)
                         ):
                             raise RuntimeError(
                                 "Node reference batch worker exited"
@@ -392,7 +405,10 @@ class ReferenceBatchPrefetchIterator(StandalonePrefetchIterator):
                 self._pool_shutdown_thread is not None
                 and self._pool_shutdown_thread.is_alive()
             )
-            or any(process.is_alive() for process in self._pool._pool)
+            or (
+                self._pool_shutdown_thread is None
+                and bool(self._pending or self._active_result)
+            )
         )
 
     def close(self, *, timeout=None):

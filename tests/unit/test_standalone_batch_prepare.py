@@ -2142,3 +2142,39 @@ def test_streamed_window_matches_full_read_for_varied_masks_and_offsets(tmp_path
                 torch.testing.assert_close(actual[key], expected[key])
             else:
                 assert actual[key] == expected[key]
+
+
+def test_node_owner_drops_duplicate_and_removed_peers(monkeypatch):
+    from contextlib import nullcontext
+    from types import SimpleNamespace
+    from verl_speco.trainer import reference_shared_frame as frame
+    ranks, notified = iter([2, 99, 2, 1]), []
+    binding = {"run_id": "run", "generation": 0, "batch_id": 0, "rank": 0, "receipt_token": "token"}
+    class Connection:
+        def __init__(self, rank): self.rank = rank
+        def __enter__(self): return self
+        def __exit__(self, *args): pass
+        def settimeout(self, value): pass
+        def send(self, data): notified.append(self.rank); return len(data)
+        def recv(self, size):
+            import json
+            return json.dumps({**binding, "rank": self.rank}).encode()
+    class Listener:
+        def __enter__(self): return self
+        def __exit__(self, *args): pass
+        def bind(self, address): pass
+        def listen(self, count): pass
+        def settimeout(self, value): pass
+        def accept(self): return Connection(next(ranks)), None
+    def wait(connection, deadline, pending):
+        if isinstance(connection, Connection) and connection.rank == 2:
+            raise frame._NodePeerExited(2)
+    monkeypatch.setattr(frame, "socket", SimpleNamespace(AF_UNIX=1, SOCK_SEQPACKET=2, socket=lambda *args: Listener()))
+    monkeypatch.setattr(frame, "os", SimpleNamespace(memfd_create=True))
+    monkeypatch.setattr(frame, "_verify_local_socket", lambda connection: connection.rank)
+    monkeypatch.setattr(frame, "_node_process_watch", lambda processes: nullcontext(wait))
+    with pytest.raises(RuntimeError, match="peer rank=2 exited"):
+        frame.serve_node_batches({0: [0], 1: [1], 2: [2]}, binding=binding,
+            prepare=lambda entries: pytest.fail("Failed rendezvous must not prepare data"),
+            max_bytes=4096, timeout=30, peer_processes={1: (1,), 2: (2,)})
+    assert notified == [2, 99, 2, 1]

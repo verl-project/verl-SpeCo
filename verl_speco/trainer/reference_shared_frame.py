@@ -426,7 +426,7 @@ def serve_node_batches(
                 wait(listener, deadline, remaining)
             except _NodePeerExited as exc:
                 failure = failure or exc
-                remaining.remove(exc.rank)
+                remaining.discard(exc.rank)
                 continue
             listener.settimeout(_remaining_time(deadline))
             connection, _ = listener.accept()
@@ -441,17 +441,21 @@ def serve_node_batches(
                     ),
                     None,
                 )
+                if peer_processes and connected_rank not in remaining:
+                    with suppress(OSError):
+                        connection.send(_NODE_BATCH_ERROR)
+                    continue
                 try:
                     wait(connection, deadline, {connected_rank})
                 except _NodePeerExited as exc:
                     failure = failure or exc
-                    remaining.remove(exc.rank)
+                    remaining.discard(exc.rank)
                     with suppress(OSError):
                         connection.send(_NODE_BATCH_ERROR)
                     continue
                 request = connection.recv(_CONTROL_LIMIT + 1)
                 if not request and connected_rank in remaining:
-                    remaining.remove(connected_rank)
+                    remaining.discard(connected_rank)
                     failure = failure or _NodePeerExited(connected_rank)
                     continue
                 if len(request) > _CONTROL_LIMIT:

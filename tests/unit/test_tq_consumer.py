@@ -331,9 +331,13 @@ def test_native_directory_mutation_failure_retains_active_fence(phase):
                 await directory.publish("sample", descriptor)
             else:
                 await directory.retire("sample", descriptor["sha256"])
-        with pytest.raises(RuntimeError, match="active references"):
-            await directory.freeze()
-        assert (await directory.status(1))["active_sample"][0]["handle"] == "sample"
+        if phase == "publish":
+            assert not directory._active_handles
+            assert await directory.freeze() == ["source"]
+        else:
+            with pytest.raises(RuntimeError, match="active references"):
+                await directory.freeze()
+            assert (await directory.status(1))["active_sample"][0]["handle"] == "sample"
     try:
         asyncio.run(run())
     finally:

@@ -6,9 +6,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import stat
 import sqlite3
 import tempfile
 from pathlib import Path
+from contextlib import ExitStack
+from verl_speco.regular_file import regular_parent
 
 
 class _ReferenceLeaseJournal:
@@ -29,7 +33,44 @@ class _ReferenceLeaseJournal:
                 "Reference lease journal requires an absolute regular-file path"
             )
         path.parent.mkdir(parents=True, exist_ok=True)
-        self.db = sqlite3.connect(str(path))
+        # sqlite3 cannot adopt an existing descriptor. Restrict its directory
+        # to this account before SQLite can create the DB and rollback journal.
+        if os.name == "posix":
+            directory_info = path.parent.stat()
+            if directory_info.st_uid != os.geteuid() or directory_info.st_mode & 0o077:
+                raise ValueError(
+                    "Reference lease journal requires an owner-only directory (0700)"
+                )
+        self._files = ExitStack()
+        try:
+            _, parent = self._files.enter_context(regular_parent(path))
+            fd = os.open(
+                path.name if parent is not None else path,
+                os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0),
+                0o600,
+                **({"dir_fd": parent} if parent is not None else {}),
+            )
+            try:
+                info = os.fstat(fd)
+                if not stat.S_ISREG(info.st_mode):
+                    raise ValueError("Reference lease journal must be a regular file")
+                if os.name == "posix":
+                    os.fchmod(fd, 0o600)
+                sqlite_path = (
+                    f"/proc/self/fd/{parent}/{path.name}"
+                    if parent is not None
+                    else str(path)
+                )
+                self.db = sqlite3.connect(sqlite_path)
+                current = path.stat(follow_symlinks=False)
+                if (current.st_dev, current.st_ino) != (info.st_dev, info.st_ino):
+                    self.db.close()
+                    raise ValueError("Reference lease journal identity changed")
+            finally:
+                os.close(fd)
+        except BaseException:
+            self._files.close()
+            raise
         try:
             self.db.execute("PRAGMA journal_mode=DELETE")
             self.db.execute("PRAGMA synchronous=FULL")
@@ -62,6 +103,7 @@ class _ReferenceLeaseJournal:
                 )
         except BaseException:
             self.db.close()
+            self._files.close()
             raise
 
     def transition(self, plan_id, phase, identity):
@@ -212,6 +254,7 @@ class _ReferenceLeaseJournal:
                 self.db.execute("DELETE FROM acknowledgements")
                 self.db.execute("DELETE FROM owner")
         self.db.close()
+        self._files.close()
 
 
 class _ReferenceIdentityLedger:

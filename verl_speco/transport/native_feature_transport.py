@@ -435,7 +435,26 @@ class NativeSourceControlClient(_NativeControlOperations):
                     )
             except BaseException:
                 self._failed = True
+                self._close_replies()
                 raise
+
+    def _close_replies(self):
+        queue, self._private_responses = self._private_responses, None
+        if queue is not None:
+            import ray
+
+            if ray.is_initialized():
+                try:
+                    queue.shutdown(force=True)
+                except ray.exceptions.RayError:
+                    logging.getLogger(__name__).debug(
+                        "Reply actor already unavailable", exc_info=True
+                    )
+
+    def close(self):
+        with self._lock:
+            self._failed = True
+            self._close_replies()
 
     def seal_if_empty(self):
         self._call("seal_if_empty", None)
@@ -655,10 +674,12 @@ class NativeSourceDirectory:
                 raise ValueError(
                     "Native source directory descriptor byte limit exceeded"
                 )
-            # Keep the active fence if indexing fails after the source has
-            # already registered this lease.
-            self._active_handles.add(handle)
             self._records[handle] = (descriptor["sha256"], descriptor)
+            try:
+                self._active_handles.add(handle)
+            except BaseException:
+                del self._records[handle]
+                raise
             self._descriptor_bytes += len(encoded)
             self._condition.notify_all()
 
@@ -752,7 +773,9 @@ class NativeSourceDirectory:
             self._frozen = True
             self._condition.notify_all()
             if require_empty and self._active_handles:
-                raise RuntimeError("Native source directory has active references")
+                raise RuntimeError(
+                    f"Native source directory has active references: {list(self._active_handles)[:4]}"
+                )
             return list(self._sources)
 
 
@@ -770,6 +793,7 @@ class NativeSourceDirectoryRouter(_NativeControlOperations):
             raise ValueError("Invalid native source directory client")
         self.directory, self.timeout = directory, float(timeout)
         self._routes, self._lock = {}, threading.Lock()
+        self._closed, self._sealed = False, False
         self._stop_lock, self._stop_result = threading.Lock(), None
 
     def _directory_call(self, method, *args):
@@ -787,6 +811,8 @@ class NativeSourceDirectoryRouter(_NativeControlOperations):
         if not isinstance(endpoint, str) or not endpoint:
             raise ValueError("Native descriptor has no source endpoint")
         with self._lock:
+            if self._closed:
+                raise RuntimeError("Native directory router is closed")
             existing = self._routes.get(endpoint)
         if existing is not None:
             return existing
@@ -795,6 +821,9 @@ class NativeSourceDirectoryRouter(_NativeControlOperations):
         options = self._directory_call("source_route", endpoint)
         candidate = NativeSourceControlClient(**options)
         with self._lock:
+            if self._closed:
+                candidate.close()
+                raise RuntimeError("Native directory router is closed")
             return self._routes.setdefault(endpoint, candidate)
 
     def _call(self, method, descriptor, **arguments):
@@ -810,8 +839,21 @@ class NativeSourceDirectoryRouter(_NativeControlOperations):
             )
 
     def freeze_and_seal(self):
-        for endpoint in self._directory_call("freeze"):
-            self._client({"segment": endpoint}).seal_if_empty()
+        if self._sealed:
+            return
+        try:
+            for endpoint in self._directory_call("freeze"):
+                self._client({"segment": endpoint}).seal_if_empty()
+            self._sealed = True
+        finally:
+            self.close()
+
+    def close(self):
+        with self._lock:
+            self._closed = True
+            clients, self._routes = list(self._routes.values()), {}
+        for client in clients:
+            client.close()
 
     def stop_admission(self):
         """Freeze publication while retaining active descriptors and source memory.

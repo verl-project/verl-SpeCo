@@ -297,16 +297,27 @@ def test_content_identity_allows_different_paths_with_identical_bytes(tmp_path):
         load_standalone_resume(checkpoint)
 
 
-def test_legacy_resume_fingerprint_without_content_hash_still_loads(tmp_path):
+@pytest.mark.parametrize("schema", [1, 2, 3])
+def test_legacy_resume_fingerprint_without_content_hash_still_loads(tmp_path, schema):
     source = tmp_path / "input.jsonl"
     source.write_text("{}\n", encoding="utf-8")
     checkpoint = tmp_path / "checkpoint"
-    save_standalone_resume(checkpoint, [1], optimizer_step=1, input_path=source)
+    save_standalone_resume(checkpoint, [1], optimizer_step=1, input_path=source, storage_format="gzip" if schema == 2 else "tensor")
     path = checkpoint / "standalone_resume.json"
     metadata = json.loads(path.read_text(encoding="utf-8"))
+    if schema < 3:
+        name = "consumed_sequence_nos.i64.gz" if schema == 2 else "consumed_sequence_nos.pt"
+        (checkpoint / metadata["consumed_sequence_file"]).rename(checkpoint / name)
+        metadata["consumed_sequence_file"] = name
+        metadata["schema_version"] = schema
     del metadata["input_fingerprint"]["sha256"]
     path.write_text(json.dumps(metadata), encoding="utf-8")
     assert load_standalone_resume(checkpoint, input_path=source)[0] == {1}
+    from verl_speco.trainer.standalone_resume import build_input_fingerprint, validate_resume_input_fingerprint
+    changed_path = build_input_fingerprint(source, include_content_hash=True)
+    changed_path["path"] = str(tmp_path / "producer" / "input.jsonl")
+    with pytest.raises(ValueError, match="Legacy checkpoint.*Consumer-local"):
+        validate_resume_input_fingerprint(metadata, changed_path)
 
 
 def _sealed_checkpoint(root, step, run_id, *, input_path=None, input_identity=None):

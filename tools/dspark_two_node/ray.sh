@@ -14,8 +14,8 @@
 # limitations under the License.
 set -eo pipefail
 source ./job.env
-ray_temp="/tmp/$SPECO_NATIVE_RUN_ID"
-mkdir -m 700 "$ray_temp"
+umask 077
+ray_temp=$(mktemp -d "/tmp/${SPECO_NATIVE_RUN_ID}.XXXXXX")
 printf '%s\n' "$ray_temp" > ray.tmp
 export RAY_TMPDIR="$ray_temp"
 unset RAY_ADDRESS
@@ -37,4 +37,5 @@ case "$ROLE" in
     ;;
   *) exit 2 ;;
 esac
-exec python3 -c 'from ray.scripts.scripts import main; main()' start "${args[@]}"
+trap 'rmdir "$ray_temp" 2>/dev/null || true' EXIT
+python3 -c 'from ray.scripts.scripts import main; main()' start "${args[@]}"

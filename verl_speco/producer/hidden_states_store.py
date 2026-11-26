@@ -28,6 +28,8 @@ representation without branching on the connector.
 
 from __future__ import annotations
 
+from verl_speco.regular_file import regular_file, regular_path, unlink_regular
+
 import contextlib
 import errno
 import importlib
@@ -229,7 +231,10 @@ def file_reference_tensor_bytes(reference: str) -> int:
             or header_bytes + 8 > before.st_size
         ):
             raise ValueError("Invalid safetensors reference header size")
-        with safe_open(str(path), framework="pt", device="cpu") as tensors:
+        with (
+            regular_path(path) as pinned,
+            safe_open(str(pinned), framework="pt", device="cpu") as tensors,
+        ):
             if not tensors.keys():
                 raise ValueError("Empty safetensors reference")
         after, current = os.fstat(stream.fileno()), path.stat()
@@ -306,6 +311,13 @@ class FileHiddenStatesStore(HiddenStatesStore):
                 )
         return path
 
+    def _pinned_path(self, path):
+        return regular_path(
+            path,
+            root=self._root_identity[0] if self.root is not None else None,
+            identity=self._root_identity[1:] if self.root is not None else None,
+        )
+
     def scan_bad_auxiliary_rows(
         self,
         reference,
@@ -362,7 +374,10 @@ class FileHiddenStatesStore(HiddenStatesStore):
         path = self.validate_reference(reference)
         if self.wait_for_writer:
             _wait_for_lock(Path(f"{path}.lock"), timeout=timeout)
-        with safe_open(str(path), framework="pt", device="cpu") as data:
+        with (
+            regular_path(path) as pinned,
+            safe_open(str(pinned), framework="pt", device="cpu") as data,
+        ):
             _validate_file_payload_fields(data)
             if data.get_tensor("token_ids").long().tolist() != list(prompt_ids):
                 raise HiddenStateAlignmentError(
@@ -430,7 +445,10 @@ class FileHiddenStatesStore(HiddenStatesStore):
         path = self.validate_reference(reference)
         if self.wait_for_writer:
             _wait_for_lock(Path(f"{path}.lock"), timeout=timeout)
-        with safe_open(str(path), framework="pt", device="cpu") as data:
+        with (
+            regular_path(path) as pinned,
+            safe_open(str(pinned), framework="pt", device="cpu") as data,
+        ):
             if "hidden_states" not in data.keys():
                 raise ValueError(
                     "vLLM hidden-states payload must contain hidden_states"
@@ -456,8 +474,10 @@ class FileHiddenStatesStore(HiddenStatesStore):
             _wait_for_lock(Path(f"{path}.lock"), timeout=timeout)
         if not path.is_file():
             raise FileNotFoundError(f"vLLM hidden-states file not found: {path}")
-        payload = dict(load_file(str(path), device="cpu"))
-        return payload, int(path.stat().st_size)
+        with self._pinned_path(path) as pinned:
+            payload = dict(load_file(str(pinned), device="cpu"))
+            byte_size = int(pinned.stat().st_size)
+        return payload, byte_size
 
     def load_window(
         self,
@@ -477,7 +497,10 @@ class FileHiddenStatesStore(HiddenStatesStore):
         _wait_for_lock(Path(f"{path}.lock"), timeout=timeout)
         if not path.is_file():
             raise FileNotFoundError(f"vLLM hidden-states file not found: {path}")
-        with safe_open(str(path), framework="pt", device="cpu") as data:
+        with (
+            regular_path(path) as pinned,
+            safe_open(str(pinned), framework="pt", device="cpu") as data,
+        ):
             _validate_file_payload_fields(data)
             hidden = data.get_slice("hidden_states")
             shape = hidden.get_shape()
@@ -523,8 +546,12 @@ class FileHiddenStatesStore(HiddenStatesStore):
 
     def release(self, reference: str) -> None:
         path = self.validate_reference(reference)
-        path.unlink(missing_ok=True)
-        Path(f"{path}.lock").unlink(missing_ok=True)
+        options = dict(
+            root=self._root_identity[0] if self.root is not None else None,
+            identity=self._root_identity[1:] if self.root is not None else None,
+        )
+        unlink_regular(path, **options)
+        unlink_regular(Path(f"{path}.lock"), **options)
 
 
 class MooncakeHiddenStatesStore(HiddenStatesStore):
@@ -762,11 +789,12 @@ def _wait_for_lock(lock_path: Path, timeout: float = 30.0) -> None:
 
     deadline = time.monotonic() + timeout
     try:
-        lock_file = lock_path.open("rb")
+        lock_context = regular_file(lock_path)
+        lock_file = lock_context.__enter__()
     except FileNotFoundError:
         # The writer removed the lock between the exists() check and open().
         return
-    with lock_file:
+    try:
         while True:
             try:
                 fcntl.flock(lock_file.fileno(), fcntl.LOCK_SH | fcntl.LOCK_NB)
@@ -780,6 +808,8 @@ def _wait_for_lock(lock_path: Path, timeout: float = 30.0) -> None:
                         f"Timed out waiting for vLLM hidden-state lock: {lock_path}"
                     ) from exc
                 time.sleep(0.01)
+    finally:
+        lock_context.__exit__(None, None, None)
 
 
 RAW_HIDDEN_FORMAT = "standalone_raw_hidden"

@@ -19,7 +19,7 @@ printf '%s\n' "$$" > "$RUN_DIR/vllm.pid"
 mapfile -t cfg < <(python3 - <<'PY'
 import json, os
 from verl_speco.standalone_tq_training_launcher import _vllm_capture_layer_ids, _vllm_kv_transfer_config
-print(json.dumps({"method":"extract_hidden_states","num_speculative_tokens":1,"draft_model_config":{"hf_config":{"eagle_aux_hidden_state_layer_ids":_vllm_capture_layer_ids([1,9,17,25,33],36)}}}, separators=(",",":")))
+print(json.dumps({"method":"extract_hidden_states","num_speculative_tokens":1,"draft_model_config":{"hf_config":{"eagle_aux_hidden_state_layer_ids":_vllm_capture_layer_ids(json.loads(os.environ["VLLM_AUX_HIDDEN_STATE_LAYER_IDS"]),int(os.environ["SPECO_TARGET_NUM_HIDDEN_LAYERS"]))}}}, separators=(",",":")))
 print(json.dumps(_vllm_kv_transfer_config(os.environ), separators=(",",":")))
 PY
 )

@@ -15,6 +15,8 @@
 
 from __future__ import annotations
 
+from verl_speco.regular_file import regular_file
+
 import gzip
 import hashlib
 import json
@@ -86,7 +88,7 @@ def producer_data_recipe(config: Mapping[str, Any]) -> dict[str, Any]:
 
 def _file_sha256(path: Path) -> str:
     digest = hashlib.sha256()
-    with path.open("rb") as source:
+    with regular_file(path) as source:
         for chunk in iter(lambda: source.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
@@ -124,7 +126,7 @@ def model_cache_content_sha256(directory: str | os.PathLike[str]) -> str:
     for path in sorted(files, key=lambda item: item.relative_to(root).as_posix()):
         relative_name = path.relative_to(root).as_posix().encode("utf-8")
         link_before = path.lstat()
-        with path.open("rb") as stream:
+        with regular_file(path) as stream:
             before = os.fstat(stream.fileno())
             digest.update(len(relative_name).to_bytes(8, "big"))
             digest.update(relative_name)
@@ -222,7 +224,10 @@ def _read_compressed_sequences(path: Path, metadata: dict[str, Any]) -> set[int]
     previous = 0
     seen = 0
     try:
-        with gzip.open(path, "rb") as stream:
+        with (
+            regular_file(path) as encoded,
+            gzip.GzipFile(fileobj=encoded, mode="rb") as stream,
+        ):
             while seen < count:
                 chunk_count = min(_CHUNK_ENTRIES, count - seen)
                 payload = stream.read(chunk_count * 8)
@@ -490,7 +495,7 @@ def _load_reference_lease_snapshot(checkpoint_dir, digest):
         )
     # Bound the read itself: a producer or shared filesystem may change the file
     # after stat(), so the size check alone cannot enforce the metadata budget.
-    with path.open("rb") as stream:
+    with regular_file(path) as stream:
         encoded = stream.read(limit + 1)
     if len(encoded) > limit:
         raise ValueError("Reference lease snapshot exceeds metadata budget")
@@ -652,9 +657,12 @@ def load_standalone_resume(
         return set(), None
     checkpoint_dir = Path(checkpoint_path)
     metadata_path = checkpoint_dir / RESUME_METADATA_NAME
+    if metadata_path.is_symlink():
+        raise ValueError("Standalone resume metadata must not be a symlink")
     if not metadata_path.is_file():
         return set(), None
-    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    with regular_file(metadata_path) as stream:
+        metadata = json.load(stream)
     if "reference_lease_snapshot_sha256" in metadata:
         _load_reference_lease_snapshot(
             checkpoint_dir, metadata["reference_lease_snapshot_sha256"]
@@ -696,6 +704,8 @@ def load_standalone_resume(
     if compressed and metadata.get("consumed_sequence_codec") != _COMPRESSED_CODEC:
         raise ValueError(f"Unsupported compressed resume codec in {metadata_path}")
     tensor_path = checkpoint_dir / tensor_name
+    if tensor_path.is_symlink():
+        raise ValueError("Standalone resume tensor must not be a symlink")
     if compressed:
         _validate_compressed_progress(tensor_path, metadata)
     expected_sha256 = metadata.get("consumed_sequence_sha256")
@@ -711,10 +721,8 @@ def load_standalone_resume(
     if compressed:
         consumed = _read_compressed_sequences(tensor_path, metadata)
     else:
-        try:
-            values = torch.load(tensor_path, map_location="cpu", weights_only=True)
-        except TypeError:
-            values = torch.load(tensor_path, map_location="cpu")
+        with regular_file(tensor_path) as tensor_stream:
+            values = torch.load(tensor_stream, map_location="cpu", weights_only=True)
         if not isinstance(values, torch.Tensor) or values.dtype != torch.int64:
             raise ValueError(f"Invalid consumed sequence tensor: {tensor_path}")
         values = values.flatten()
@@ -752,6 +760,11 @@ def validate_resume_input_fingerprint(metadata, fingerprint):
         differs = input_content_identity(current) != identity
     else:
         if isinstance(saved, dict) and "sha256" not in saved:
+            if saved.get("path") != current.get("path"):
+                raise ValueError(
+                    "Legacy checkpoint has no content hash. Producer-only cold resume "
+                    "requires Consumer-local input at the original path to verify and upgrade the checkpoint."
+                )
             current.pop("sha256", None)
         differs = saved != current
     if differs:
