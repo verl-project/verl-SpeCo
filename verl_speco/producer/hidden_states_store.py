@@ -214,12 +214,12 @@ class HiddenStatesStore:
         """Release any backend resources held by the store."""
 
 
-def file_reference_tensor_bytes(reference: str) -> int:
+def file_reference_tensor_bytes(reference: str, *, root=None, identity=None) -> int:
     """Inspect a stable safetensors header without loading tensor payloads."""
     from safetensors import safe_open
 
     path = Path(reference)
-    with path.open("rb") as stream:
+    with regular_file(path, root=root, identity=identity) as stream:
         before = os.fstat(stream.fileno())
         prefix = stream.read(8)
         if len(prefix) != 8:
@@ -232,7 +232,7 @@ def file_reference_tensor_bytes(reference: str) -> int:
         ):
             raise ValueError("Invalid safetensors reference header size")
         with (
-            regular_path(path) as pinned,
+            regular_path(path, root=root, identity=identity) as pinned,
             safe_open(str(pinned), framework="pt", device="cpu") as tensors,
         ):
             if not tensors.keys():
@@ -289,6 +289,11 @@ class FileHiddenStatesStore(HiddenStatesStore):
         if self.root is not None:
             info = self.root.stat()
             self._root_identity = (self.root.resolve(), info.st_dev, info.st_ino)
+        self._file_options = (
+            {"root": self._root_identity[0], "identity": self._root_identity[1:]}
+            if self.root is not None
+            else {}
+        )
 
     def validate_reference(self, reference: str) -> Path:
         path = Path(reference)
@@ -312,10 +317,11 @@ class FileHiddenStatesStore(HiddenStatesStore):
         return path
 
     def _pinned_path(self, path):
-        return regular_path(
-            path,
-            root=self._root_identity[0] if self.root is not None else None,
-            identity=self._root_identity[1:] if self.root is not None else None,
+        return regular_path(path, **self._file_options)
+
+    def tensor_bytes(self, reference):
+        return file_reference_tensor_bytes(
+            str(self.validate_reference(reference)), **self._file_options
         )
 
     def scan_bad_auxiliary_rows(
@@ -373,9 +379,9 @@ class FileHiddenStatesStore(HiddenStatesStore):
         deadline = time.monotonic() + timeout
         path = self.validate_reference(reference)
         if self.wait_for_writer:
-            _wait_for_lock(Path(f"{path}.lock"), timeout=timeout)
+            _wait_for_lock(Path(f"{path}.lock"), timeout=timeout, **self._file_options)
         with (
-            regular_path(path) as pinned,
+            self._pinned_path(path) as pinned,
             safe_open(str(pinned), framework="pt", device="cpu") as data,
         ):
             _validate_file_payload_fields(data)
@@ -444,9 +450,9 @@ class FileHiddenStatesStore(HiddenStatesStore):
 
         path = self.validate_reference(reference)
         if self.wait_for_writer:
-            _wait_for_lock(Path(f"{path}.lock"), timeout=timeout)
+            _wait_for_lock(Path(f"{path}.lock"), timeout=timeout, **self._file_options)
         with (
-            regular_path(path) as pinned,
+            self._pinned_path(path) as pinned,
             safe_open(str(pinned), framework="pt", device="cpu") as data,
         ):
             if "hidden_states" not in data.keys():
@@ -471,7 +477,7 @@ class FileHiddenStatesStore(HiddenStatesStore):
             raise RuntimeError("vLLM hidden-state replay requires safetensors") from exc
         path = self.validate_reference(reference)
         if self.wait_for_writer:
-            _wait_for_lock(Path(f"{path}.lock"), timeout=timeout)
+            _wait_for_lock(Path(f"{path}.lock"), timeout=timeout, **self._file_options)
         if not path.is_file():
             raise FileNotFoundError(f"vLLM hidden-states file not found: {path}")
         with self._pinned_path(path) as pinned:
@@ -494,11 +500,12 @@ class FileHiddenStatesStore(HiddenStatesStore):
         from verl_speco.trainer.target_feature_replay import HiddenStateAlignmentError
 
         path = self.validate_reference(reference)
-        _wait_for_lock(Path(f"{path}.lock"), timeout=timeout)
+        if self.wait_for_writer:
+            _wait_for_lock(Path(f"{path}.lock"), timeout=timeout, **self._file_options)
         if not path.is_file():
             raise FileNotFoundError(f"vLLM hidden-states file not found: {path}")
         with (
-            regular_path(path) as pinned,
+            self._pinned_path(path) as pinned,
             safe_open(str(pinned), framework="pt", device="cpu") as data,
         ):
             _validate_file_payload_fields(data)
@@ -770,7 +777,9 @@ def build_hidden_states_store(
     return FileHiddenStatesStore(resolved.file_root)
 
 
-def _wait_for_lock(lock_path: Path, timeout: float = 30.0) -> None:
+def _wait_for_lock(
+    lock_path: Path, timeout: float = 30.0, *, root=None, identity=None
+) -> None:
     if not lock_path.exists():
         return
     try:
@@ -789,7 +798,7 @@ def _wait_for_lock(lock_path: Path, timeout: float = 30.0) -> None:
 
     deadline = time.monotonic() + timeout
     try:
-        lock_context = regular_file(lock_path)
+        lock_context = regular_file(lock_path, root=root, identity=identity)
         lock_file = lock_context.__enter__()
     except FileNotFoundError:
         # The writer removed the lock between the exists() check and open().

@@ -440,11 +440,14 @@ class Source:
             {"channel_id": options["channel_id"], "request_id": "0" * 32, "ok": True}, timeout=5)
     def validate_concurrent_clients(self):
         from concurrent.futures import ThreadPoolExecutor
-        from verl_speco.transport.native_feature_transport import NativeSourceControlClient
-        clients = [NativeSourceControlClient(**self.connector._native_control_options) for _ in range(2)]
+        from verl_speco.transport.native_feature_transport import NativeSourceControlClient, NativeSourceControlRouter
+        router = NativeSourceControlRouter({"source": self.connector._native_control_options})
+        clients = [router._routes["source"], NativeSourceControlClient(**self.connector._native_control_options)]
         with ThreadPoolExecutor(max_workers=2) as pool:
             list(pool.map(lambda client: client.validate_published(self.descriptor_value()), clients))
         actors = [client._private_responses.actor for client in clients]
+        router.close()
+        router.close()
         for client in clients:
             client.close()
             client.close()
@@ -3178,6 +3181,28 @@ def test_live_trainer_topology_gloo_agrees_before_model_loading(bad):
                 "lookup": "Cannot verify live trainer placement", "budget": "disagree on the configured topology",
                 "owner_split": "must share one verified Ray node"}.get(bad, "ok")
     assert all(expected in item[1] for item in results)
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux journal directory requirements")
+@pytest.mark.parametrize("mode", [0o755, 0o1777, 0o600, 0o000, 0o700])
+def test_journal_requires_private_accessible_parent_and_procfs(tmp_path, monkeypatch, mode):
+    from pathlib import Path
+    from verl_speco.producer.reference_ledger import _ReferenceLeaseJournal
+    directory = tmp_path / "leases"
+    directory.mkdir(mode=0o700)
+    directory.chmod(mode)
+    try:
+        if mode != 0o700:
+            with pytest.raises(ValueError, match="mkdir -m 700"):
+                _ReferenceLeaseJournal(directory / "leases.sqlite", "run", "incarnation")
+        else:
+            original = Path.is_dir
+            monkeypatch.setattr(Path, "is_dir", lambda path: False if str(path) == "/proc/self/fd" else original(path))
+            with pytest.raises(ValueError, match="mount procfs"):
+                _ReferenceLeaseJournal(directory / "leases.sqlite", "run", "incarnation")
+    finally:
+        directory.chmod(0o700)
+    assert not (directory / "leases.sqlite").exists()
 
 
 def test_journal_checks_sqlite_actual_database_identity(tmp_path, monkeypatch):

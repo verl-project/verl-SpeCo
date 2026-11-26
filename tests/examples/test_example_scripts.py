@@ -483,8 +483,12 @@ def test_two_node_failed_reader_shutdown_preserves_source(
     assert stopped == ["reader"]
 
 
-@pytest.mark.parametrize("width,layers", [(4096, 36), (8192, 64)])
-def test_two_node_native_budget_covers_long_samples(two_node_controller, monkeypatch, width, layers):
+@pytest.mark.parametrize("width,layers,dtype,dtype_bytes", [
+    (4096, 36, "bfloat16", 2), (8192, 64, "float64", 8), (128, 8, "fp32", 4),
+    (128, 5, "bfloat16", 2), (128, 6, "bfloat16", 2), (128, 7, "bfloat16", 2),
+    (128, 36, "unknown", 0),
+])
+def test_two_node_native_budget_covers_long_samples(two_node_controller, monkeypatch, width, layers, dtype, dtype_bytes):
     import json
     import io
     import shlex
@@ -503,7 +507,7 @@ def test_two_node_native_budget_covers_long_samples(two_node_controller, monkeyp
         open_sftp=lambda: nullcontext(SimpleNamespace(open=write_remote))
     )
     monkeypatch.setattr(two_node_controller, "execute",
-        lambda *args: json.dumps({"num_hidden_layers": layers,"hidden_size": width,"torch_dtype":"bfloat16"}))
+        lambda *args: json.dumps({"num_hidden_layers": layers,"hidden_size": width,"torch_dtype":dtype}))
     args = SimpleNamespace(
         root="/jobs",
         repo="/repo",
@@ -514,6 +518,11 @@ def test_two_node_native_budget_covers_long_samples(two_node_controller, monkeyp
         producer_npu=0,
         consumer_env=None,
     )
+    if layers < 8 or dtype_bytes == 0:
+        with pytest.raises(ValueError, match="distinct auxiliary layers|Unsupported model dtype"):
+            two_node_controller.prepare(client, args, "consumer", "test", "token", 0)
+        assert not staged
+        return
     two_node_controller.prepare(client, args, "consumer", "test", "token", 0)
     env = dict(
         shlex.split(line.removeprefix("export "))[0].split("=", 1)
@@ -522,8 +531,9 @@ def test_two_node_native_budget_covers_long_samples(two_node_controller, monkeyp
     )
     # Full 8k Qwen3-8B capture (five auxiliary layers + final layer), token IDs,
     # and conservative space for both aligned payload and validity registrations.
-    payload_bytes = 8192 * width * 6 * 2 + 8192 * 8
+    payload_bytes = 8192 * width * 6 * dtype_bytes + 8192 * 8
     assert json.loads(env["VLLM_AUX_HIDDEN_STATE_LAYER_IDS"])[-1] == layers - 3
+    assert len(set(json.loads(env["VLLM_AUX_HIDDEN_STATE_LAYER_IDS"]))) == 5
     registered_bytes = payload_bytes + 4 * 1024**2
     assert int(env["SPECO_NATIVE_READER_MAX_BYTES"]) >= registered_bytes
     assert int(env["SPECO_NATIVE_SOURCE_MAX_BYTES"]) >= (

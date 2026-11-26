@@ -36,10 +36,19 @@ class _ReferenceLeaseJournal:
         # sqlite3 cannot adopt an existing descriptor. Restrict its directory
         # to this account before SQLite can create the DB and rollback journal.
         if os.name == "posix":
-            directory_info = path.parent.stat()
-            if directory_info.st_uid != os.geteuid() or directory_info.st_mode & 0o077:
+            if not Path("/proc/self/fd").is_dir():
                 raise ValueError(
-                    "Reference lease journal requires an owner-only directory (0700)"
+                    "Reference lease journaling on POSIX requires Linux with /proc/self/fd mounted; "
+                    "mount procfs or leave reference_lease_journal_path unset"
+                )
+            directory_info = path.parent.stat()
+            if (
+                directory_info.st_uid != os.geteuid()
+                or stat.S_IMODE(directory_info.st_mode) != 0o700
+            ):
+                raise ValueError(
+                    f"Reference lease journal requires an owner-only directory (0700) owned by the current user: "
+                    f"{path.parent}. Create a private subdirectory with mkdir -m 700 and use a DB path inside it"
                 )
         self._files = ExitStack()
         try:

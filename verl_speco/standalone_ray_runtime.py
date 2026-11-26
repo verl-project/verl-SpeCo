@@ -906,7 +906,10 @@ class StandaloneProducerActor:
                         "File tensor byte accounting requires file references"
                     )
                 size = await asyncio.to_thread(
-                    file_reference_tensor_bytes, tag["hidden_states_path"]
+                    self._reference_file_store.tensor_bytes
+                    if self._reference_file_store is not None
+                    else file_reference_tensor_bytes,
+                    tag["hidden_states_path"],
                 )
                 if size > self._single_file_bytes_limit:
                     raise ValueError(

@@ -1,6 +1,6 @@
 # verl-SpeCo Usage Guide
 
-Last updated: 11/19/2026
+Last updated: 11/26/2026
 
 Use the version and runtime guidance below to install SpeCo and run online co-training or standalone drafter training. For the project overview and architecture, see the [README](../README.md).
 
@@ -410,8 +410,13 @@ supervised response. Text such as `<tool_call>...</tool_call>` is preserved.
 The tools schema is passed to the target tokenizer's chat template and, when
 enabled, to the server-side `/render` boundary calls. Rows without `tools`
 retain the existing rendering behavior. Both sequential and shuffled reading
-support JSON arrays; arrays are loaded in memory, so JSONL is preferable for
-large datasets. Non-Parquet files with other extensions, including files without
+support JSON arrays, including UTF-8 BOM files. Arrays have a 64 MiB encoded-file
+limit checked before parsing, including sequential reads. Parsed Python objects
+consume more memory than the encoded file. `max_indexed_records` additionally
+limits shuffled array records after parsing; `max_jsonl_line_bytes` applies only
+to JSONL. Convert larger datasets to JSONL or Parquet. `tools` requires a
+chat-message prompt; string prompts with `tools` are rejected. Non-Parquet files
+with other extensions, including files without
 an extension, retain line-by-line JSONL parsing and its per-record error policy.
 
 Streaming standalone training runs the Producer as a Ray actor and the Consumer
@@ -706,6 +711,22 @@ hash `metadata.json` and `manifest.jsonl`. Resume skips consumed occurrences and
 rejects changed indexes or shuffle settings. Treat the dataset as immutable during
 training; tensor files themselves are not content-hashed by this cursor. Supply an
 existing drafter checkpoint through the usual drafter `model_path` to resume.
+
+Content-verified model caches (`drafter.training.target_model_cache_content_identity=true`)
+must be expanded local directories without symlinks. Standard HuggingFace
+`snapshots/<revision>` trees link files into `blobs`; first copy the snapshot to a
+separate local directory with `cp -rL <snapshot> <expanded-model>` and use that
+directory as the target model path. Saved-hidden `metadata.json` and
+`manifest.jsonl` must also be regular files without symlinks.
+
+`speco.standalone_tq_producer.reference_lease_journal_path` is optional. On POSIX
+it requires Linux with `/proc/self/fd` mounted. Put the SQLite file in an absolute,
+symlink-free directory owned by the training user with exactly mode `0700`, for
+example `mkdir -m 700 /tmp/speco-leases` and
+`reference_lease_journal_path=/tmp/speco-leases/leases.sqlite`. Directly using
+`/tmp/leases.sqlite` or a group-readable shared job directory is rejected. Create
+a private subdirectory instead of changing permissions on a shared directory.
+Keep unresolved journals for fencing/reconciliation before reusing their paths.
 
 ## Configuration
 

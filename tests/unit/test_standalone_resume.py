@@ -909,6 +909,27 @@ def test_resume_recipe_detects_changed_target_config(tmp_path):
         _validate_resume_training_plan(metadata, 2, {"recipe": after})
 
 
+@pytest.mark.parametrize("kind", ["model", "saved_hidden"])
+def test_content_fingerprints_explain_symlink_restriction(tmp_path, kind):
+    from verl_speco.trainer.standalone_resume import model_cache_content_sha256
+    root, blobs = tmp_path / "snapshot", tmp_path / "blobs"
+    root.mkdir()
+    blobs.mkdir()
+    (root / "config.json").write_text("{}")
+    target = blobs / "weights"
+    target.write_bytes(b"weights")
+    name = "weights.safetensors" if kind == "model" else "metadata.json"
+    try:
+        (root / name).symlink_to(target)
+    except OSError:
+        pytest.skip("Symlinks unavailable")
+    with pytest.raises(ValueError, match="symlinks.*expanded"):
+        if kind == "model":
+            model_cache_content_sha256(root)
+        else:
+            build_input_fingerprint(root, include_content_hash=True)
+
+
 def test_verified_model_cache_identity_is_path_independent_and_content_bound(tmp_path):
     import os
     import shutil

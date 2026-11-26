@@ -214,7 +214,14 @@ def prepare(client, args, role, name, token, generation):
     if layers < 5 or width <= 0:
         raise ValueError("The DSpark example requires at least five target layers and a positive hidden size")
     layer_ids = [1 + i * (layers - 4) // 4 for i in range(5)]
-    dtype_bytes = 4 if model_config.get("torch_dtype", model_config.get("dtype")) == "float32" else 2
+    if len(set(layer_ids)) != 5:
+        raise ValueError("The DSpark example requires five distinct auxiliary layers (at least eight target layers)")
+    dtype = str(model_config.get("torch_dtype") or model_config.get("dtype") or "bfloat16").removeprefix("torch.")
+    dtype_sizes = {"float16": 2, "fp16": 2, "half": 2, "bfloat16": 2, "bf16": 2,
+                   "float32": 4, "fp32": 4, "float": 4, "float64": 8, "fp64": 8, "double": 8}
+    if dtype not in dtype_sizes:
+        raise ValueError(f"Unsupported model dtype for native buffer sizing: {dtype}")
+    dtype_bytes = dtype_sizes[dtype]
     alignment = 2 << 20
     payload_bytes = 8192 * (width * (len(layer_ids) + 1) * dtype_bytes + 8) + (4 << 20)
     reuse_bytes = ((payload_bytes + alignment - 1) // alignment) * alignment

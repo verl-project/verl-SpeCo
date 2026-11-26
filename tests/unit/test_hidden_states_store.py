@@ -518,7 +518,9 @@ def test_regular_file_rejects_symlink_and_preserves_target(tmp_path, operation):
     assert target.read_bytes() == b"keep"
 
 
-def test_shared_root_replacement_between_validation_and_open_is_rejected(tmp_path, monkeypatch):
+@pytest.mark.parametrize("operation", ["load", "hidden_shape", "load_window", "scan_bad_auxiliary_rows", "tensor_bytes", "lock"])
+def test_shared_root_replacement_between_validation_and_open_is_rejected(tmp_path, monkeypatch, operation):
+    from pathlib import Path
     root = tmp_path / "shared"
     root.mkdir()
     reference = root / "sample"
@@ -530,7 +532,23 @@ def test_shared_root_replacement_between_validation_and_open_is_rejected(tmp_pat
         root.rename(tmp_path / "original-root")
         root.mkdir()
         reference.write_bytes(b"replacement")
+        if operation == "lock":
+            Path(f"{reference}.lock").touch()
         return path
     monkeypatch.setattr(store, "validate_reference", replace_root)
     with pytest.raises(ValueError, match="shared file root changed"):
-        store.load(str(reference))
+        if operation == "load_window":
+            store.load_window(str(reference), all_positions=[0], selected_positions=[0], prompt_length=1)
+        elif operation == "scan_bad_auxiliary_rows":
+            store.scan_bad_auxiliary_rows(str(reference), all_positions=[0], selected_positions=[0],
+                prompt_ids=[1], auxiliary_layers=1, required_layers=1, feature_dtype=torch.bfloat16, clip_value=None)
+        elif operation == "lock":
+            from verl_speco.producer.hidden_states_store import _wait_for_lock
+            store.validate_reference(str(reference))
+            # The file connector uses flock on Linux; exercise its pinned open.
+            import sys
+            if sys.platform != "linux":
+                pytest.skip("Linux flock")
+            _wait_for_lock(Path(f"{reference}.lock"), **store._file_options)
+        else:
+            getattr(store, operation)(str(reference))

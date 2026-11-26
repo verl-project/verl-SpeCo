@@ -89,6 +89,10 @@ def producer_data_recipe(config: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def _file_sha256(path: Path) -> str:
+    if path.is_symlink():
+        raise ValueError(
+            f"Input fingerprint requires regular files without symlinks: {path}. Copy with symlinks expanded"
+        )
     digest = hashlib.sha256()
     with regular_file(path) as source:
         for chunk in iter(lambda: source.read(1024 * 1024), b""):
@@ -99,6 +103,9 @@ def _file_sha256(path: Path) -> str:
 def model_cache_content_sha256(directory: str | os.PathLike[str]) -> str:
     """Hash all regular files by relative path and contents, independent of cache location."""
     root = Path(directory)
+    symlink_error = "Content-verified model cache requires files and directories without symlinks; copy the HF snapshot with symlinks expanded (cp -rL)"
+    if any(path.is_symlink() for path in (root, *root.parents)):
+        raise ValueError(symlink_error)
     if not root.is_dir():
         raise ValueError("Content-verified model cache must be a local directory")
     files, directories = [], []
@@ -112,9 +119,11 @@ def model_cache_content_sha256(directory: str | os.PathLike[str]) -> str:
         children.sort()
         for child in children:
             if (current_path / child).is_symlink():
-                raise ValueError("Model cache cannot contain directory symlinks")
+                raise ValueError(symlink_error)
         for name in sorted(names):
             path = current_path / name
+            if path.is_symlink():
+                raise ValueError(symlink_error)
             if not path.is_file():
                 raise ValueError("Model cache contains a non-regular file")
             files.append(path)

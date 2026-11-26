@@ -188,13 +188,41 @@ def test_jsonl_array_first_line_respects_skip_policy(tmp_path, suffix, order):
 
 
 @pytest.mark.parametrize("suffix", [".json", ".JSON"])
-def test_json_array_skips_invalid_tool_rows_in_both_readers(tmp_path, suffix):
+@pytest.mark.parametrize("encoding", ["utf-8", "utf-8-sig"])
+def test_json_array_skips_invalid_tool_rows_in_both_readers(tmp_path, suffix, encoding):
     path = tmp_path / f"input{suffix}"
     bad = {**_tool_row("bad"), "tools": "invalid"}
-    path.write_text(json.dumps([_tool_row(), bad, _tool_row("tool-b")]), encoding="utf-8")
+    path.write_text(json.dumps([_tool_row(), bad, _tool_row("tool-b")]), encoding=encoding)
     readers = [input_reader.iter_input_records(path), input_reader.ShuffledJsonlReader(path).iter_records([0, 1, 2])]
     for reader in readers:
         assert [record.sample_id for record in reader] == ["tool-a", "tool-b"]
+
+
+@pytest.mark.parametrize("shuffled", [False, True])
+def test_json_array_size_bound_precedes_decoding(tmp_path, monkeypatch, shuffled):
+    path = tmp_path / "large.json"
+    # A sparse oversized array must fail before any complete read or JSON decode.
+    with path.open("wb") as stream:
+        stream.write(b"[")
+        stream.truncate(input_reader.MAX_JSON_ARRAY_BYTES + 1)
+    monkeypatch.setattr(input_reader.json, "loads", lambda *args: pytest.fail("oversized array was decoded"))
+    with pytest.raises(ValueError, match="convert the dataset to JSONL"):
+        if shuffled:
+            input_reader.ShuffledJsonlReader(path, max_indexed_records=1)
+        else:
+            list(input_reader.iter_input_records(path))
+
+
+def test_json_array_record_limit_and_string_tools_are_rejected(tmp_path):
+    path = tmp_path / "input.json"
+    path.write_text(json.dumps([_tool_row(), _tool_row("other")]), encoding="utf-8")
+    with pytest.raises(ValueError, match="max_indexed_records"):
+        input_reader.ShuffledJsonlReader(path, max_indexed_records=1)
+    row = {"prompt": "hello", "tools": _tool_row()["tools"]}
+    with pytest.raises(ValueError, match="chat-message prompt"):
+        input_reader._record_from_payload(row, "test", 0, False)
+    with pytest.raises(ValueError, match="chat-message prompt"):
+        input_reader._prompt_ids("hello", None, tools=row["tools"])
 
 
 @pytest.mark.parametrize("response_budget", [0, 2, 3])

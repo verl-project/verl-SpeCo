@@ -488,6 +488,10 @@ class NativeSourceControlRouter(_NativeControlOperations):
             raise ValueError("Native descriptor has no configured source control route")
         return getattr(self._routes[endpoint], method)(descriptor, **arguments)
 
+    def close(self):
+        for client in self._routes.values():
+            client.close()
+
 
 class NativeSourceDirectory:
     """Bounded run-scoped handle registry for source control and descriptors."""

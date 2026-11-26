@@ -77,6 +77,9 @@ speco:
     source_route_max_sequence_tokens: 65536
     # Optional absolute local SQLite path; unresolved ownership blocks reuse.
     # Requires scheduler.per_rank_reference_ack=true; not an automatic recovery permit.
+    # POSIX requires Linux + mounted /proc/self/fd. Parent must be owned by this
+    # user with mode 0700 (including owner rwx). Use a private subdirectory,
+    # e.g. mkdir -m 700 /tmp/speco-leases; not /tmp/leases.sqlite directly.
     reference_lease_journal_path: null
     # Optional aggregate prompt + generation token budget; zero disables it.
     max_inflight_tokens: 0
@@ -126,6 +129,7 @@ speco:
     # Disabled by default to preserve IDs in existing runs and checkpoints.
     stable_source_ids: false
     # Zero disables each limit; source-proportional ordering has separate bounds.
+    # JSON arrays have a separate fixed 64 MiB encoded-file limit before parsing.
     max_jsonl_line_bytes: 0
     max_indexed_records: 10000000
     # Hash indexed rows to detect edits that preserve file metadata.

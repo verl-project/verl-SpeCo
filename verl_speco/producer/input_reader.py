@@ -33,6 +33,8 @@ from verl_speco.data.parse import clean_conversation_roles
 logger = logging.getLogger(__name__)
 DEFAULT_MAX_JSONL_LINE_BYTES = 0
 DEFAULT_MAX_INDEXED_RECORDS = 10_000_000
+# Arrays are materialized in memory. Large datasets must use JSONL/Parquet.
+MAX_JSON_ARRAY_BYTES = 64 * 1024**2
 
 
 def _bounded_jsonl_line(stream, limit: int) -> bytes:
@@ -455,6 +457,8 @@ def _record_from_payload(
         payload, location, strict_roles=parser_strict_roles
     )
     prompt = _normalize_prompt(prompt_value, location)
+    if tools is not None and isinstance(prompt, str):
+        raise ValueError("Tools require a chat-message prompt, not a string prompt")
     if response is not None and (not isinstance(response, str) or not response):
         raise ValueError("field 'response' must be a non-empty string when present")
     sample_id = payload.get("sample_id") or _extra_info_index(payload)
@@ -616,6 +620,8 @@ def _is_json_array(input_path: Path) -> bool:
     if input_path.suffix.lower() != ".json":
         return False
     with input_path.open("rb") as input_file:
+        if input_file.read(3) != b"\xef\xbb\xbf":
+            input_file.seek(0)
         token = input_file.read(1)
         while token and token in b" \t\r\n":
             token = input_file.read(1)
@@ -623,8 +629,13 @@ def _is_json_array(input_path: Path) -> bool:
 
 
 def _load_json_array(input_path: Path) -> list[Any]:
-    with input_path.open("r", encoding="utf-8") as input_file:
-        payloads = json.load(input_file)
+    with input_path.open("rb") as input_file:
+        if os.fstat(input_file.fileno()).st_size > MAX_JSON_ARRAY_BYTES:
+            raise ValueError("JSON array exceeds 64 MiB; convert the dataset to JSONL")
+        encoded = input_file.read(MAX_JSON_ARRAY_BYTES + 1)
+        if len(encoded) > MAX_JSON_ARRAY_BYTES:
+            raise ValueError("JSON array exceeds 64 MiB; convert the dataset to JSONL")
+    payloads = json.loads(encoded.decode("utf-8-sig"))
     if not isinstance(payloads, list):
         raise ValueError(f"Producer input {input_path} must contain a JSON array")
     return payloads
@@ -965,6 +976,8 @@ def _prompt_ids(
     tools: list[dict[str, Any]] | None = None,
 ) -> list[int]:
     if isinstance(prompt, str):
+        if tools is not None:
+            raise ValueError("Tools require a chat-message prompt, not a string prompt")
         return _token_ids(tokenizer(prompt, add_special_tokens=False))
     apply_chat_template = getattr(tokenizer, "apply_chat_template", None)
     if not callable(apply_chat_template):
