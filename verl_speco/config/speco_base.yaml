@@ -62,6 +62,8 @@ speco:
     trust_remote_code: false
     vllm_endpoints:
       - http://localhost:8000/v1
+    # HTTP request model name, matching vLLM --served-model-name when set.
+    # The standalone launcher defaults this to actor_rollout_ref.model.path.
     vllm_model: null
     request_timeout: 120
     max_inflight_requests: 16

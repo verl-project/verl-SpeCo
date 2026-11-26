@@ -1401,3 +1401,31 @@ def test_real_two_rank_resume_checks_recipe_consensus(tmp_path, mismatch):
         assert all("differs or failed across ranks" in value for _, value in outputs)
     else:
         assert all(value == [0, 3] for _, value in outputs)
+
+
+def test_resume_hash_and_load_use_the_same_snapshot(tmp_path, monkeypatch):
+    import torch
+    import verl_speco.trainer.standalone_resume as resume
+    source = tmp_path / "input"
+    source.write_bytes(b"row")
+    checkpoint = tmp_path / "checkpoint"
+    resume.save_standalone_resume(checkpoint, [1], optimizer_step=1, input_path=source)
+    metadata = json.loads((checkpoint / resume.RESUME_METADATA_NAME).read_text())
+    progress = checkpoint / metadata["consumed_sequence_file"]
+    load = torch.load
+    def replace_before_load(stream, *args, **kwargs):
+        torch.save(torch.tensor([99], dtype=torch.int64), progress)
+        return load(stream, *args, **kwargs)
+    monkeypatch.setattr(torch, "load", replace_before_load)
+    assert resume.load_standalone_resume(checkpoint, input_path=source)[0] == {1}
+
+
+def test_hashed_resume_without_bound_identity_accepts_relocated_input(tmp_path):
+    from verl_speco.trainer.standalone_resume import build_input_fingerprint, validate_resume_input_fingerprint
+    source = tmp_path / "input"
+    source.write_bytes(b"row")
+    saved = build_input_fingerprint(source, include_content_hash=True)
+    relocated = dict(saved, path="/producer/input", mtime_ns=saved["mtime_ns"] + 1)
+    validate_resume_input_fingerprint({"input_fingerprint": saved}, relocated)
+    with pytest.raises(ValueError, match="input file changed"):
+        validate_resume_input_fingerprint({"input_fingerprint": saved}, dict(relocated, sha256="0" * 64))

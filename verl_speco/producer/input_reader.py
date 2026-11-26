@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Streaming verl/JSONL input and token preparation for the Producer."""
+"""JSONL, JSON-array and Parquet input and token preparation for the Producer."""
 
 from __future__ import annotations
 
@@ -58,6 +58,7 @@ class InputRecord:
     prompt: str | tuple[dict[str, str], ...]
     response: str | None
     source_metadata: dict[str, Any]
+    tools: list[dict[str, Any]] | None = None
 
 
 @dataclass(frozen=True)
@@ -100,7 +101,7 @@ def iter_input_records(
     parser_strict_roles: bool = False,
     max_jsonl_line_bytes: int = DEFAULT_MAX_JSONL_LINE_BYTES,
 ) -> Iterator[InputRecord]:
-    """Yield prompt/response records from one JSONL or Parquet file.
+    """Yield prompt/response records from one JSONL, JSON-array or Parquet file.
 
     Args:
         path: Input file.
@@ -164,12 +165,13 @@ class ShuffledInputUnsupportedError(ValueError):
 
 
 class ShuffledJsonlReader:
-    """Byte-offset index over a JSONL input for shuffled replay.
+    """Shuffled replay of JSONL offsets or in-memory JSON-array records.
 
     Replacement for buffering the parsed dataset in memory: the index pass
     stores one (byte offset, line number) pair per non-empty line and records
     are re-read lazily in the caller's order, so memory stays at a few bytes
     per line instead of one parsed record per line.
+    JSON arrays are loaded once in memory; use JSONL for large datasets.
 
     Parsing and the ``on_error`` policy match :func:`iter_input_records`. The
     ``max_consecutive_errors`` breaker counts consecutive failures in the
@@ -211,7 +213,7 @@ class ShuffledJsonlReader:
             raise FileNotFoundError(f"Producer input file not found: {input_path}")
         if _is_parquet(input_path):
             raise ShuffledInputUnsupportedError(
-                f"Shuffled replay needs line-seekable JSONL input, got {input_path}"
+                f"Shuffled replay needs JSONL or JSON-array input, got {input_path}"
             )
         self._input_path = input_path
         self._on_error = on_error
@@ -234,6 +236,33 @@ class ShuffledJsonlReader:
         self._source_labels: list[str] = []
         self._line_digests = bytearray()
         unique_sources: dict[str, str] = {}
+        before = self._signature(input_path.stat())
+        self._payloads = (
+            _load_json_array(input_path) if _is_json_array(input_path) else None
+        )
+        if self._payloads is not None:
+            if max_indexed_records and len(self._payloads) > max_indexed_records:
+                raise ValueError("JSON input exceeds max_indexed_records")
+            if source_field:
+                if len(self._payloads) > 1_000_000:
+                    raise ValueError(
+                        "Source-proportional input exceeds 1000000 records"
+                    )
+                for payload in self._payloads:
+                    label = (
+                        payload.get(source_field) if isinstance(payload, dict) else None
+                    )
+                    if not isinstance(label, str) or not label or len(label) > 1024:
+                        raise ValueError(f"Invalid source label at {input_path}")
+                    if label not in unique_sources and len(unique_sources) >= 256:
+                        raise ValueError(
+                            "Source-proportional input exceeds 256 sources"
+                        )
+                    self._source_labels.append(unique_sources.setdefault(label, label))
+            self._source_signature = self._signature(input_path.stat())
+            if before != self._source_signature:
+                raise ValueError("JSON input changed during indexing")
+            return
         with input_path.open("rb") as input_file:
             initial_stat = os.fstat(input_file.fileno())
             offset = 0
@@ -331,6 +360,8 @@ class ShuffledJsonlReader:
 
     @property
     def record_count(self) -> int:
+        if self._payloads is not None:
+            return len(self._payloads)
         return len(self._offsets)
 
     def iter_records(self, order: Iterable[int]) -> Iterator[InputRecord]:
@@ -362,26 +393,31 @@ class ShuffledJsonlReader:
         with self._input_path.open("rb") as input_file:
             self._check_input(input_file)
             for index in order:
-                self._check_input(input_file)
-                input_file.seek(self._offsets[index])
-                raw_line = _bounded_jsonl_line(input_file, self._line_limit)
-                self._check_input(input_file)
-                if (
-                    self._verify_lines
-                    and hashlib.sha256(raw_line).digest()
-                    != self._line_digests[32 * index : 32 * (index + 1)]
-                ):
-                    raise ValueError("JSONL input changed after indexing")
-                line_number = self._line_numbers[index]
-                location = f"{self._input_path}:{line_number}"
-                try:
-                    payload = json.loads(raw_line.decode("utf-8"))
-                except (UnicodeDecodeError, json.JSONDecodeError) as error:
-                    handle_error(
-                        location,
-                        ValueError(f"Invalid JSON object at {location}: {error}"),
-                    )
-                    continue
+                if self._payloads is not None:
+                    self._check_input(input_file)
+                    payload = self._payloads[index]
+                    location = f"{self._input_path}:item {index + 1}"
+                else:
+                    self._check_input(input_file)
+                    input_file.seek(self._offsets[index])
+                    raw_line = _bounded_jsonl_line(input_file, self._line_limit)
+                    self._check_input(input_file)
+                    if (
+                        self._verify_lines
+                        and hashlib.sha256(raw_line).digest()
+                        != self._line_digests[32 * index : 32 * (index + 1)]
+                    ):
+                        raise ValueError("JSONL input changed after indexing")
+                    line_number = self._line_numbers[index]
+                    location = f"{self._input_path}:{line_number}"
+                    try:
+                        payload = json.loads(raw_line.decode("utf-8"))
+                    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+                        handle_error(
+                            location,
+                            ValueError(f"Invalid JSON object at {location}: {error}"),
+                        )
+                        continue
                 try:
                     record = _record_from_payload(
                         payload,
@@ -410,6 +446,11 @@ def _record_from_payload(
 ) -> InputRecord:
     if not isinstance(payload, dict):
         raise ValueError("Producer input must be a JSON-style object")
+    tools = payload.get("tools")
+    if tools is not None and (
+        not isinstance(tools, list) or any(not isinstance(tool, dict) for tool in tools)
+    ):
+        raise ValueError("field 'tools' must be a list of objects when present")
     prompt_value, response = _prompt_response_from_payload(
         payload, location, strict_roles=parser_strict_roles
     )
@@ -433,6 +474,7 @@ def _record_from_payload(
         prompt=prompt,
         response=response,
         source_metadata=source_metadata,
+        tools=tools,
     )
 
 
@@ -562,7 +604,30 @@ def _iter_payloads(
     if _is_parquet(input_path):
         yield from _iter_parquet_payloads(input_path)
         return
+    if _is_json_array(input_path):
+        for index, payload in enumerate(_load_json_array(input_path)):
+            yield f"{input_path}:item {index + 1}", payload
+        return
     yield from _iter_jsonl_payloads(input_path, on_error, max_jsonl_line_bytes)
+
+
+def _is_json_array(input_path: Path) -> bool:
+    # Preserve legacy line-by-line parsing unless array format is opted into.
+    if input_path.suffix.lower() != ".json":
+        return False
+    with input_path.open("rb") as input_file:
+        token = input_file.read(1)
+        while token and token in b" \t\r\n":
+            token = input_file.read(1)
+        return token == b"["
+
+
+def _load_json_array(input_path: Path) -> list[Any]:
+    with input_path.open("r", encoding="utf-8") as input_file:
+        payloads = json.load(input_file)
+    if not isinstance(payloads, list):
+        raise ValueError(f"Producer input {input_path} must contain a JSON array")
+    return payloads
 
 
 def _is_parquet(input_path: Path) -> bool:
@@ -665,12 +730,16 @@ def tokenize_record_with_render_boundary(
     from verl_speco.data.render_boundary import boundary_from_renders
 
     messages = list(record.prompt)
+    tool_options = {"tools": record.tools} if record.tools is not None else {}
     max_length = int(_config_value(config, "max_sequence_length", 0) or 0) or None
-    prompt_ids = render_fn(messages, add_generation_prompt=True, max_length=max_length)
+    prompt_ids = render_fn(
+        messages, add_generation_prompt=True, max_length=max_length, **tool_options
+    )
     full_ids = render_fn(
         [*messages, {"role": "assistant", "content": record.response}],
         add_generation_prompt=False,
         max_length=max_length,
+        **tool_options,
     )
     history_ids = None
     if full_ids[: len(prompt_ids)] != prompt_ids:
@@ -679,7 +748,7 @@ def tokenize_record_with_render_boundary(
         # third round-trip when the prompt render already extends into the full
         # one.
         history_ids = render_fn(
-            messages, add_generation_prompt=False, max_length=max_length
+            messages, add_generation_prompt=False, max_length=max_length, **tool_options
         )
     boundary = boundary_from_renders(prompt_ids, full_ids, history_ids)
     if len(full_ids) <= boundary:
@@ -719,7 +788,8 @@ def tokenize_record(
             f"Producer sample {record.sample_id!r} has no response; prepare it for "
             "target-model generation instead"
         )
-    prompt_ids = _prompt_ids(record.prompt, tokenizer)
+    tool_options = {"tools": record.tools} if record.tools is not None else {}
+    prompt_ids = _prompt_ids(record.prompt, tokenizer, **tool_options)
     if isinstance(record.prompt, str):
         full_ids = _token_ids(
             tokenizer(record.prompt + record.response, add_special_tokens=False)
@@ -738,6 +808,7 @@ def tokenize_record(
                 [*record.prompt, {"role": "assistant", "content": record.response}],
                 tokenize=True,
                 add_generation_prompt=False,
+                **tool_options,
             )
         )
         if full_ids[: len(prompt_ids)] != prompt_ids:
@@ -745,6 +816,7 @@ def tokenize_record(
                 record.prompt,
                 record.response,
                 tokenizer,
+                **tool_options,
             )
     if full_ids[: len(prompt_ids)] != prompt_ids:
         raise ValueError(
@@ -777,7 +849,8 @@ def prepare_generation_request(
         raise ValueError(
             f"Producer sample {record.sample_id!r} already contains a response"
         )
-    prompt_ids = _prompt_ids(record.prompt, tokenizer)
+    tool_options = {"tools": record.tools} if record.tools is not None else {}
+    prompt_ids = _prompt_ids(record.prompt, tokenizer, **tool_options)
     max_sequence_length = int(_config_value(config, "max_sequence_length", 0) or 0)
     max_tokens = int(_config_value(config, "generation_max_tokens", 0) or 0)
     if max_tokens <= 0:
@@ -885,7 +958,12 @@ def prepare_generated_prefill_request(
     )
 
 
-def _prompt_ids(prompt: str | tuple[dict[str, str], ...], tokenizer: Any) -> list[int]:
+def _prompt_ids(
+    prompt: str | tuple[dict[str, str], ...],
+    tokenizer: Any,
+    *,
+    tools: list[dict[str, Any]] | None = None,
+) -> list[int]:
     if isinstance(prompt, str):
         return _token_ids(tokenizer(prompt, add_special_tokens=False))
     apply_chat_template = getattr(tokenizer, "apply_chat_template", None)
@@ -898,6 +976,7 @@ def _prompt_ids(prompt: str | tuple[dict[str, str], ...], tokenizer: Any) -> lis
             list(prompt),
             tokenize=True,
             add_generation_prompt=True,
+            **({"tools": tools} if tools is not None else {}),
         )
     )
 
@@ -906,6 +985,8 @@ def _tokenize_chat_response_with_explicit_boundary(
     prompt: tuple[dict[str, str], ...],
     response: str,
     tokenizer: Any,
+    *,
+    tools: list[dict[str, Any]] | None = None,
 ) -> tuple[list[int], list[int]]:
     """Render a chat response while keeping its loss boundary deterministic.
 
@@ -922,6 +1003,7 @@ def _tokenize_chat_response_with_explicit_boundary(
         [*prompt, {"role": "assistant", "content": marker}],
         tokenize=False,
         add_generation_prompt=False,
+        **({"tools": tools} if tools is not None else {}),
     )
     if not isinstance(rendered, str) or rendered.count(marker) != 1:
         raise ValueError(

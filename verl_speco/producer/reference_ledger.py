@@ -12,7 +12,7 @@ import sqlite3
 import tempfile
 from pathlib import Path
 from contextlib import ExitStack
-from verl_speco.regular_file import regular_parent
+from verl_speco.regular_file import regular_file, regular_parent
 
 
 class _ReferenceLeaseJournal:
@@ -62,6 +62,22 @@ class _ReferenceLeaseJournal:
                     else str(path)
                 )
                 self.db = sqlite3.connect(sqlite_path)
+                database_path = next(
+                    item[2]
+                    for item in self.db.execute("PRAGMA database_list")
+                    if item[1] == "main"
+                )
+                # SQLite may canonicalize a symlink encountered while opening.
+                # Validate its actual main database, not only our original name.
+                with regular_file(Path(database_path).resolve(strict=True)) as opened:
+                    database_info = os.fstat(opened.fileno())
+                if (database_info.st_dev, database_info.st_ino) != (
+                    info.st_dev,
+                    info.st_ino,
+                ):
+                    raise ValueError(
+                        "Reference lease journal connection identity differs"
+                    )
                 current = path.stat(follow_symlinks=False)
                 if (current.st_dev, current.st_ino) != (info.st_dev, info.st_ino):
                     self.db.close()
@@ -69,6 +85,9 @@ class _ReferenceLeaseJournal:
             finally:
                 os.close(fd)
         except BaseException:
+            connection = getattr(self, "db", None)
+            if connection is not None:
+                connection.close()
             self._files.close()
             raise
         try:

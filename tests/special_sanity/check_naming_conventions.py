@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import re
+import subprocess
 import sys
 from pathlib import Path
 
@@ -52,7 +53,12 @@ SGLANG_MISSPELLING = re.compile(r"Sglang|sgLang|sglAng|sglaNg|sglanG")
 
 
 def _iter_text_files(root: Path):
-    for path in root.rglob("*"):
+    result = subprocess.run(
+        ["git", "ls-files", "--cached", "--others", "--exclude-standard", "-z"],
+        cwd=root, capture_output=True, text=True, encoding="utf-8", check=True,
+    )
+    for filename in sorted(set(result.stdout.split("\0")) - {""}):
+        path = root / filename
         if not path.is_file():
             continue
         if any(part in EXCLUDED_DIRS for part in path.parts):

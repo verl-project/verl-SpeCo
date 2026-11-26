@@ -250,6 +250,22 @@ def test_pipeline_config_derives_transport_identity_from_training_args() -> None
     assert config.run_id.startswith("dspark-")
 
 
+@pytest.mark.parametrize("model_name", [None, "served-qwen3", "'served qwen3'"])
+@pytest.mark.parametrize("transport", ["ray_reference", "tq"])
+def test_pipeline_respects_served_model_name(model_name, transport):
+    key = "speco.standalone_tq_producer.vllm_model"
+    args = [*_training_args(), f"speco.draft_training.data_transport={transport}"]
+    if model_name is not None:
+        args.extend([f"{key}=older-name", f"++{key}={model_name}"])
+    config = resolve_pipeline_config(args, environ={})
+    commands = build_pipeline_commands(config, args, ray_address="ray://unit", env={})
+    assert [item for item in commands.producer_overrides if item.startswith(f"{key}=")] == [
+        f"{key}={model_name or '/models/Qwen3-8B'}"
+    ]
+    assert config.model_path == "/models/Qwen3-8B"
+    assert "actor_rollout_ref.model.path=/models/Qwen3-8B" in commands.consumer_overrides
+
+
 @pytest.mark.parametrize("prefix", ["", "++"])
 def test_pipeline_forwards_dflash_block_size_to_producer(prefix):
     key = "actor_rollout_ref.rollout.drafter.training.dflash_block_size"

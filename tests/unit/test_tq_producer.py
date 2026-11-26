@@ -162,6 +162,50 @@ class _ChatTokenizer:
         return [9, 10]
 
 
+@pytest.mark.parametrize("shuffle", [False, True])
+def test_tool_json_array_produces_aligned_training_payload(tmp_path, shuffle):
+    tools = [{"type": "function", "function": {"name": "remove_member", "parameters": {"type": "object"}}}]
+    response = "<tool_call>\n<function=remove_member>member</function>\n</tool_call>"
+    rows = [{
+        "sample_id": f"tool-{index}", "tools": tools,
+        "conversations": [
+            {"from": "system", "value": "Choose a tool."},
+            {"from": "human", "value": "Remove member."},
+            {"from": "assistant", "value": response},
+        ],
+    } for index in range(2)]
+    path = tmp_path / "input.json"
+    path.write_text(json.dumps(rows), encoding="utf-8")
+    calls = []
+
+    class ToolTokenizer:
+        def apply_chat_template(self, messages, *, tokenize, add_generation_prompt, tools):
+            calls.append(tools)
+            text = json.dumps(tools) + "".join(f"[{item['role']}]{item['content']}" for item in messages)
+            if add_generation_prompt:
+                text += "[assistant]"
+            return list(text.encode("utf-8"))
+
+    config = _config(path)
+    config["speco"]["standalone_tq_producer"].update(
+        shuffle=shuffle, shuffle_seed=42, max_feature_length=0,
+        max_sequence_length=4096, on_error="raise",
+    )
+    transport, pool = _Transport(), _Pool(tmp_path)
+    stats = asyncio.run(run_producer(
+        config, transport=transport, tokenizer=ToolTokenizer(), client_pool=pool,
+    ))
+    assert stats.published_count == 2
+    assert stats.filtered_count == stats.failed_count == 0
+    assert calls == [tools] * 4
+    for key, tag in transport.records.items():
+        if tag.get("record_type") != "sample":
+            continue
+        sample = decode_sample(key, tag, transport.payloads[key], {"run_id": "run-a"})
+        assert sample.input_ids.numel() == sample.loss_mask.numel() == sample.hidden_states.shape[0]
+        assert bytes(sample.input_ids[sample.loss_mask.bool()].tolist()).decode("utf-8") == response
+
+
 class _Transport:
     def __init__(self, *, fail_sample_put: bool = False):
         self.fail_sample_put = fail_sample_put

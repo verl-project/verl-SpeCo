@@ -18,6 +18,8 @@ from __future__ import annotations
 from verl_speco.regular_file import regular_file
 
 import gzip
+import tempfile
+from contextlib import nullcontext
 import hashlib
 import json
 import os
@@ -208,7 +210,9 @@ def _validate_compressed_progress(path: Path, metadata: dict[str, Any]) -> int:
     return count
 
 
-def _read_compressed_sequences(path: Path, metadata: dict[str, Any]) -> set[int]:
+def _read_compressed_sequences(
+    path: Path, metadata: dict[str, Any], *, encoded_snapshot=None
+) -> set[int]:
     """Validate checksums, decoded length and strictly increasing int64 values."""
     import numpy as np
 
@@ -225,7 +229,11 @@ def _read_compressed_sequences(path: Path, metadata: dict[str, Any]) -> set[int]
     seen = 0
     try:
         with (
-            regular_file(path) as encoded,
+            (
+                regular_file(path)
+                if encoded_snapshot is None
+                else nullcontext(encoded_snapshot)
+            ) as encoded,
             gzip.GzipFile(fileobj=encoded, mode="rb") as stream,
         ):
             while seen < count:
@@ -709,20 +717,31 @@ def load_standalone_resume(
     if compressed:
         _validate_compressed_progress(tensor_path, metadata)
     expected_sha256 = metadata.get("consumed_sequence_sha256")
-    if expected_sha256 is not None or version in {
-        _COMPRESSED_SCHEMA_VERSION,
-        _IMMUTABLE_SCHEMA_VERSION,
-    }:
-        if not isinstance(expected_sha256, str) or len(expected_sha256) != 64:
-            raise ValueError(f"Invalid consumed sequence checksum in {metadata_path}")
-        actual_sha256 = _file_sha256(tensor_path)
-        if actual_sha256 != expected_sha256:
+    requires_hash = version in {_COMPRESSED_SCHEMA_VERSION, _IMMUTABLE_SCHEMA_VERSION}
+    if (expected_sha256 is not None or requires_hash) and (
+        not isinstance(expected_sha256, str) or len(expected_sha256) != 64
+    ):
+        raise ValueError(f"Invalid consumed sequence checksum in {metadata_path}")
+    # Hash and deserialize the same private snapshot. The named source may be
+    # replaced or modified after it is opened, including by another local job.
+    with (
+        regular_file(tensor_path) as source,
+        tempfile.SpooledTemporaryFile(max_size=8 * 1024**2) as snapshot,
+    ):
+        digest = hashlib.sha256()
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            snapshot.write(chunk)
+            digest.update(chunk)
+        if expected_sha256 is not None and digest.hexdigest() != expected_sha256:
             raise ValueError(f"Consumed sequence checksum mismatch in {checkpoint_dir}")
-    if compressed:
-        consumed = _read_compressed_sequences(tensor_path, metadata)
-    else:
-        with regular_file(tensor_path) as tensor_stream:
-            values = torch.load(tensor_stream, map_location="cpu", weights_only=True)
+        snapshot.seek(0)
+        if compressed:
+            consumed = _read_compressed_sequences(
+                tensor_path, metadata, encoded_snapshot=snapshot
+            )
+        else:
+            values = torch.load(snapshot, map_location="cpu", weights_only=True)
+    if not compressed:
         if not isinstance(values, torch.Tensor) or values.dtype != torch.int64:
             raise ValueError(f"Invalid consumed sequence tensor: {tensor_path}")
         values = values.flatten()
@@ -766,7 +785,10 @@ def validate_resume_input_fingerprint(metadata, fingerprint):
                     "requires Consumer-local input at the original path to verify and upgrade the checkpoint."
                 )
             current.pop("sha256", None)
-        differs = saved != current
+        if isinstance(saved, dict) and "sha256" in saved:
+            differs = input_content_identity(saved) != input_content_identity(current)
+        else:
+            differs = saved != current
     if differs:
         raise ValueError(
             "Standalone resume input file changed since the checkpoint was saved: "

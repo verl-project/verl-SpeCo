@@ -3178,3 +3178,45 @@ def test_live_trainer_topology_gloo_agrees_before_model_loading(bad):
                 "lookup": "Cannot verify live trainer placement", "budget": "disagree on the configured topology",
                 "owner_split": "must share one verified Ray node"}.get(bad, "ok")
     assert all(expected in item[1] for item in results)
+
+
+def test_journal_checks_sqlite_actual_database_identity(tmp_path, monkeypatch):
+    import sqlite3
+    from verl_speco.producer.reference_ledger import _ReferenceLeaseJournal
+    outside = tmp_path / "outside.sqlite"
+    connect = sqlite3.connect
+    with connect(outside) as db:
+        db.execute("CREATE TABLE sentinel (value)")
+        db.execute("INSERT INTO sentinel VALUES (7)")
+    monkeypatch.setattr(sqlite3, "connect", lambda *args, **kwargs: connect(outside))
+    with pytest.raises(ValueError, match="connection identity differs"):
+        _ReferenceLeaseJournal(tmp_path / "expected.sqlite", "run", "incarnation")
+    with connect(outside) as db:
+        assert db.execute("SELECT * FROM sentinel").fetchall() == [(7,)]
+        assert not db.execute("SELECT 1 FROM sqlite_master WHERE name='owner'").fetchall()
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux SQLite inode replacement protection")
+def test_journal_rejects_replaced_and_restored_database_name(tmp_path, monkeypatch):
+    import os
+    import sqlite3
+    from verl_speco.producer.reference_ledger import _ReferenceLeaseJournal
+    outside, expected, backup = tmp_path / "outside", tmp_path / "expected", tmp_path / "backup"
+    connect = sqlite3.connect
+    with connect(outside) as db:
+        db.execute("CREATE TABLE sentinel (value)")
+        db.execute("INSERT INTO sentinel VALUES (7)")
+    def replace_name(name, *args, **kwargs):
+        expected.rename(backup)
+        try:
+            os.link(outside, expected)
+            return connect(name, *args, **kwargs)
+        finally:
+            expected.unlink(missing_ok=True)
+            backup.rename(expected)
+    monkeypatch.setattr(sqlite3, "connect", replace_name)
+    with pytest.raises((ValueError, sqlite3.DatabaseError)):
+        _ReferenceLeaseJournal(expected, "run", "incarnation")
+    with connect(outside) as db:
+        assert db.execute("SELECT * FROM sentinel").fetchall() == [(7,)]
+        assert not db.execute("SELECT 1 FROM sqlite_master WHERE name='owner'").fetchall()
