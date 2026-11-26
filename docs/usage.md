@@ -392,6 +392,28 @@ SPECO_VLLM_ENDPOINTS='[http://127.0.0.1:8000/v1,http://127.0.0.1:8001/v1]' \
   bash examples/run_qwen3-8b_drafter_dspark_separate_training.sh
 ```
 
+If the target service uses a custom `--served-model-name`, pass its name as
+`speco.standalone_tq_producer.vllm_model` when launching training:
+
+```bash
+bash examples/run_qwen3-8b_drafter_dspark_separate_training.sh \
+  speco.standalone_tq_producer.vllm_model=my-served-qwen3
+```
+
+When omitted, the HTTP request model name defaults to `MODEL_PATH`.
+
+Standalone input also accepts JSON arrays of records in `.json` files
+(case-insensitive), including ShareGPT rows
+with top-level `tools` and `conversations` containing `from`/`value` messages.
+`human` is mapped to `user`, and the final assistant message supplies the
+supervised response. Text such as `<tool_call>...</tool_call>` is preserved.
+The tools schema is passed to the target tokenizer's chat template and, when
+enabled, to the server-side `/render` boundary calls. Rows without `tools`
+retain the existing rendering behavior. Both sequential and shuffled reading
+support JSON arrays; arrays are loaded in memory, so JSONL is preferable for
+large datasets. Non-Parquet files with other extensions, including files without
+an extension, retain line-by-line JSONL parsing and its per-record error policy.
+
 Streaming standalone training runs the Producer as a Ray actor and the Consumer
 as a Ray WorkerGroup. `speco.draft_training.data_transport=ray_reference` is the
 default: the scheduler assigns hidden-state references to Consumers. Set

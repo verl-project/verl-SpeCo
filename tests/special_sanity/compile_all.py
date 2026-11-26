@@ -16,16 +16,30 @@
 
 from __future__ import annotations
 
-import compileall
-import os
-import re
-
-EXCLUDE = re.compile(r"(^|[\\/])(\.venv|venv|\.git|__pycache__)([\\/]|$)")
+import py_compile
+import subprocess
+import tempfile
+import warnings
+from pathlib import Path
 
 
 def main() -> int:
-    os.environ["PYTHONWARNINGS"] = "error"
-    return 0 if compileall.compile_dir(".", quiet=1, rx=EXCLUDE) else 1
+    result = subprocess.run(
+        ["git", "ls-files", "--cached", "--others", "--exclude-standard", "-z", "--", "*.py"],
+        capture_output=True, text=True, encoding="utf-8", check=True,
+    )
+    failed = False
+    with tempfile.TemporaryDirectory(prefix="speco-compile-") as directory, warnings.catch_warnings():
+        warnings.simplefilter("error", SyntaxWarning)
+        for index, filename in enumerate(sorted(set(result.stdout.split("\0")) - {""})):
+            if not Path(filename).is_file():
+                continue
+            try:
+                py_compile.compile(filename, cfile=str(Path(directory) / f"{index}.pyc"), doraise=True)
+            except (py_compile.PyCompileError, OSError) as exc:
+                print(exc)
+                failed = True
+    return int(failed)
 
 
 if __name__ == "__main__":
