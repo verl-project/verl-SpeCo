@@ -56,7 +56,10 @@ from verl_speco.producer.hidden_states_store import (
     require_saved_hidden_checkpoint_fingerprint,
 )
 from verl_speco.standalone_layer_ids import normalize_standalone_layer_ids
-from verl_speco.trainer.standalone_resume import load_standalone_resume
+from verl_speco.trainer.standalone_resume import (
+    load_standalone_resume,
+    parse_bool_setting,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -289,14 +292,7 @@ def _strip_quotes(value: str) -> str:
 def _override_bool(value: str | None, *, default: bool) -> bool:
     if value is None:
         return default
-    text = _strip_quotes(value).strip().lower()
-    if text in {"", "null", "none"}:
-        return default
-    if text in {"1", "true", "yes", "on"}:
-        return True
-    if text in {"0", "false", "no", "off"}:
-        return False
-    raise ValueError(f"Expected a boolean override, got {value!r}")
+    return parse_bool_setting(_strip_quotes(value), default=default)
 
 
 @lru_cache(maxsize=1)

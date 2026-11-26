@@ -107,6 +107,7 @@ from verl_speco.integration.vllm_runtime import (
 from verl_speco.rl_insight_bridge import trace_state as _rl_insight_trace_state
 from verl_speco.trainer.bubble_profiler import inject_bubble_metrics
 from verl_speco.trainer.hard_sample_selection import partition_hard_candidates
+from verl_speco.trainer.standalone_resume import parse_bool_setting
 from verl_speco.trainer.scheduler import (
     AcceptanceFeedback,
     AfterActorUpdateContext,
@@ -1426,7 +1427,9 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             resume_setting = training_cfg.get(
                 "resume_lr_scheduler_from_checkpoint", True
             )
-        if not bool(resume_setting):
+        if resume_setting is None:
+            return
+        if not parse_bool_setting(resume_setting, default=False):
             return
 
         resume_step = self._speco_resume_global_step_hint()

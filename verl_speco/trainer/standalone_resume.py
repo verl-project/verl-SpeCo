@@ -74,11 +74,30 @@ def build_input_fingerprint(path: str | os.PathLike[str]) -> dict[str, Any]:
                     for chunk in iter(lambda: stream.read(1024 * 1024), b""):
                         digest.update(chunk)
                 fingerprints[name] = digest.hexdigest()
+            shard_fingerprints: dict[str, dict[str, int]] = {}
+            try:
+                with manifest_path.open(encoding="utf-8") as stream:
+                    for line in stream:
+                        if not line.strip():
+                            continue
+                        entry = json.loads(line)
+                        shard_name = entry.get("path")
+                        if not shard_name:
+                            continue
+                        shard_stat = (input_path / str(shard_name)).stat()
+                        shard_fingerprints[str(shard_name)] = {
+                            "size_bytes": int(shard_stat.st_size)
+                        }
+            except (OSError, ValueError) as exc:
+                raise ValueError(
+                    f"Cannot fingerprint shard files under {input_path}: {exc}"
+                ) from exc
             return {
                 "path": str(input_path),
                 "format": "standalone_raw_hidden",
                 "sampler_version": 1,
                 "files": fingerprints,
+                "shards": shard_fingerprints,
             }
         jsonl_files = sorted(input_path.glob("*.jsonl"))
         if jsonl_files:
@@ -107,6 +126,25 @@ def build_input_fingerprint(path: str | os.PathLike[str]) -> dict[str, Any]:
         "path": str(input_path),
         **_file_content_fingerprint(input_path),
     }
+
+
+def parse_bool_setting(value: Any, *, default: bool) -> bool:
+    """Parse a boolean config value without ``bool("false")`` surprises."""
+
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    text = str(value).strip().lower()
+    if text in {"", "null", "none"}:
+        return default
+    if text in {"1", "true", "yes", "on"}:
+        return True
+    if text in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"Expected a boolean setting, got {value!r}")
 
 
 def save_standalone_resume(
@@ -271,6 +309,7 @@ __all__ = [
     "RESUME_METADATA_NAME",
     "build_input_fingerprint",
     "load_standalone_resume",
+    "parse_bool_setting",
     "save_standalone_resume",
     "validate_standalone_loader_config",
 ]

@@ -21,6 +21,7 @@ pytest.importorskip("torch")
 from verl_speco.trainer.standalone_resume import (
     build_input_fingerprint,
     load_standalone_resume,
+    parse_bool_setting,
     save_standalone_resume,
     validate_standalone_loader_config,
 )
@@ -313,3 +314,40 @@ def test_large_file_fingerprint_detects_head_and_tail_changes(
 
     path.write_bytes(b"0123456789abcdefghiX")
     assert build_input_fingerprint(path) != original
+
+
+def test_build_input_fingerprint_includes_raw_hidden_shard_sizes(
+    tmp_path: Path,
+) -> None:
+    data_dir = tmp_path / "raw"
+    data_dir.mkdir()
+    metadata_path = data_dir / "metadata.json"
+    metadata_path.write_text('{"format": "torch_shard"}\n', encoding="utf-8")
+    shard_path = data_dir / "shard_000000.pt"
+    shard_path.write_bytes(b"abc")
+    (data_dir / "manifest.jsonl").write_text(
+        '{"path": "shard_000000.pt", "num_samples": 1}\n', encoding="utf-8"
+    )
+
+    fingerprint = build_input_fingerprint(data_dir)
+    assert fingerprint["format"] == "standalone_raw_hidden"
+    assert fingerprint["shards"]["shard_000000.pt"]["size_bytes"] == 3
+
+    metadata_path.write_text('{"format": "other"}\n', encoding="utf-8")
+    assert build_input_fingerprint(data_dir) != fingerprint
+
+    metadata_path.write_text('{"format": "torch_shard"}\n', encoding="utf-8")
+    shard_path.write_bytes(b"abcdef")
+    assert build_input_fingerprint(data_dir) != fingerprint
+
+
+def test_parse_bool_setting_handles_strings_and_numbers() -> None:
+    assert parse_bool_setting(True, default=False) is True
+    assert parse_bool_setting("false", default=True) is False
+    assert parse_bool_setting("true", default=False) is True
+    assert parse_bool_setting("0", default=True) is False
+    assert parse_bool_setting("on", default=False) is True
+    assert parse_bool_setting("", default=True) is True
+    assert parse_bool_setting(None, default=True) is True
+    with pytest.raises(ValueError, match="boolean setting"):
+        parse_bool_setting("nope", default=False)

@@ -416,7 +416,6 @@ class DraftFeatureDataLoader:
             local_error: Exception | None = None
             keys: list[str] = []
             rank_samples: list[DraftStoredSample] = []
-            global_samples_empty = False
             try:
                 keys = list(
                     self.store.iter_keys(
@@ -439,7 +438,6 @@ class DraftFeatureDataLoader:
                             for sample in self._read_filtered(keys)
                             if self._sample_in_step_window(sample)
                         ]
-                        global_samples_empty = not samples
                         if samples:
                             rank_samples = samples[rank::world_size]
                             if world_size > 1:
@@ -489,7 +487,7 @@ class DraftFeatureDataLoader:
                     "land on a different boundary and could repeat or skip "
                     "samples. Fix the store or start a fresh run."
                 )
-            if not keys or global_samples_empty:
+            if not rank_samples:
                 if skip_batches > 0:
                     raise ValueError(
                         "DraftFeatureDataLoader resume cursor "
@@ -497,15 +495,18 @@ class DraftFeatureDataLoader:
                         "0 batches available in this epoch; the checkpoint and "
                         "feature store are inconsistent."
                     )
-                return
-            rank_samples = self._maybe_group_by_length(rank_samples)
-            if not rank_samples:
+                if self._uses_step_window:
+                    # A step window with no matches is a normal end of stream.
+                    # _synchronize_length() made this decision identical on
+                    # every rank (min length is zero everywhere).
+                    return
                 raise RuntimeError(
                     f"DraftFeatureDataLoader epoch={epoch} rank={rank} produced no "
                     "usable samples after filtering "
                     f"({self.format_filter_stats()}); check the feature store and "
                     "read-side filters"
                 )
+            rank_samples = self._maybe_group_by_length(rank_samples)
             batch: list[DraftStoredSample] = []
             batch_index = 0
             skip_remaining = skip_batches

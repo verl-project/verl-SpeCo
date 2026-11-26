@@ -59,6 +59,7 @@ from verl_speco.trainer.standalone_prefetch import StandalonePrefetchIterator
 from verl_speco.trainer.standalone_resume import (
     build_input_fingerprint,
     load_standalone_resume,
+    parse_bool_setting,
     save_standalone_resume,
     validate_standalone_loader_config,
 )
@@ -220,10 +221,8 @@ async def _run_standalone_draft_training_async(
         resume_input_path = _standalone_resume_input_path(
             config, feature_store_type, feature_store_cfg
         )
-        resume_input_fingerprint = (
-            build_input_fingerprint(resume_input_path)
-            if resume_input_path is not None
-            else None
+        resume_input_fingerprint = _resolve_input_fingerprint(
+            resume_input_path, rank=rank
         )
         file_loader_config = (
             _standalone_loader_config(
@@ -257,7 +256,14 @@ async def _run_standalone_draft_training_async(
                 )
             if feature_store_type not in {"tq", "ray_reference"} and resume_metadata:
                 file_data_progress = resume_metadata.get("data_progress")
-                if file_data_progress is not None and file_loader_config is not None:
+                if file_data_progress is None:
+                    logger.warning(
+                        "[standalone rank=%s] checkpoint sidecar has no data_progress; "
+                        "file-store data cursor restarts at batch 0 (functional, not "
+                        "exact resume)",
+                        rank,
+                    )
+                elif file_loader_config is not None:
                     saved_loader = resume_metadata.get("data_loader")
                     validate_standalone_loader_config(saved_loader, file_loader_config)
                     if saved_loader is None:
@@ -1192,7 +1198,43 @@ def _standalone_resume_enabled(training_cfg: Any) -> bool:
     resume_setting = training_cfg.get("resume_trainer_state_from_checkpoint", None)
     if resume_setting is None:
         resume_setting = training_cfg.get("resume_lr_scheduler_from_checkpoint", True)
-    return bool(resume_setting)
+    if resume_setting is None:
+        # Match base_trainer's bool(None) for an explicit null fallback.
+        return False
+    return parse_bool_setting(resume_setting, default=True)
+
+
+def _resolve_input_fingerprint(path: str | None, *, rank: int) -> dict[str, Any] | None:
+    """Build the resume input fingerprint once and share it across ranks.
+
+    Content fingerprints can touch every JSONL/shard file. Computing them on
+    every rank multiplies network-filesystem I/O by the world size, so rank 0
+    computes and broadcasts the result. A rank-0 failure is broadcast too so
+    every rank fails together instead of waiting on a different collective.
+    """
+
+    if not dist.is_initialized() or dist.get_world_size() <= 1:
+        return build_input_fingerprint(path) if path is not None else None
+
+    # All ranks call the broadcast even when path is None so a per-rank config
+    # inconsistency cannot leave one rank waiting in a different collective.
+    payload: list[Any] = [None, None]
+    if rank == 0 and path is not None:
+        try:
+            payload[0] = build_input_fingerprint(path)
+        except Exception as exc:  # noqa: BLE001 - broadcast to every rank
+            payload[1] = f"{type(exc).__name__}: {exc}"
+    dist.broadcast_object_list(payload, src=0)
+    if payload[1] is not None:
+        raise RuntimeError(
+            f"Failed to fingerprint standalone resume input {path!r} on rank 0: "
+            f"{payload[1]}"
+        )
+    if payload[0] is None:
+        return None
+    if not isinstance(payload[0], dict):
+        raise RuntimeError("Rank 0 returned an invalid input fingerprint")
+    return payload[0]
 
 
 def _standalone_resume_input_path(
@@ -1201,7 +1243,9 @@ def _standalone_resume_input_path(
     """Input identity used by the standalone resume sidecar.
 
     TQ/ray-reference producers consume ``data.train_files``; deterministic file
-    stores are identified by their manifest (falling back to the store dir).
+    stores with metadata and a manifest are identified by their directory so
+    metadata, manifest and shard sizes are all fingerprinted. Other file stores
+    fall back to the manifest file or the store path.
     """
     if feature_store_type in {"tq", "ray_reference"}:
         return _standalone_input_path(config)
@@ -1209,7 +1253,13 @@ def _standalone_resume_input_path(
     if not path:
         return None
     path = str(path)
+    metadata = os.path.join(path, "metadata.json")
     manifest = os.path.join(path, "manifest.jsonl")
+    if os.path.isfile(metadata) and os.path.isfile(manifest):
+        # Return the directory so build_input_fingerprint hashes both the
+        # metadata and the manifest (and the shard sizes listed by it), not
+        # just the manifest file.
+        return path
     return manifest if os.path.isfile(manifest) else path
 
 

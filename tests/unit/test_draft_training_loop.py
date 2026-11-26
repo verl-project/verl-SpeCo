@@ -25,6 +25,7 @@ torch = pytest.importorskip("torch")
 from omegaconf import OmegaConf  # noqa: E402
 
 from verl_speco.trainer.base_trainer import DrafterBaseTrainer  # noqa: E402
+from verl_speco.trainer.standalone_resume import build_input_fingerprint  # noqa: E402
 from verl_speco.trainer.draft_training_loop import (  # noqa: E402
     _assert_standalone_layer_migration,
     _build_backend,
@@ -38,6 +39,8 @@ from verl_speco.trainer.draft_training_loop import (  # noqa: E402
     _log_standalone_tracking_metrics,
     _max_across_ranks_int,
     _next_batch_across_ranks,
+    _resolve_input_fingerprint,
+    _standalone_resume_input_path,
     _raise_standalone_export_error,
     _rewrite_standalone_block_runtime_config,
     _save_standalone_checkpoint,
@@ -1369,6 +1372,23 @@ def test_standalone_resume_enabled_matches_trainer_setting() -> None:
         )
         is True
     )
+    assert (
+        _standalone_resume_enabled(
+            {"resume_trainer_state_from_checkpoint": "false"}
+        )
+        is False
+    )
+    assert (
+        _standalone_resume_enabled(
+            {"resume_trainer_state_from_checkpoint": "true"}
+        )
+        is True
+    )
+    assert _standalone_resume_enabled({"resume_trainer_state_from_checkpoint": 0}) is False
+    with pytest.raises(ValueError, match="boolean setting"):
+        _standalone_resume_enabled(
+            {"resume_trainer_state_from_checkpoint": "not-a-bool"}
+        )
 
 
 def test_file_data_loader_weights_only_starts_at_first_batch() -> None:
@@ -1390,3 +1410,42 @@ def test_file_data_loader_weights_only_starts_at_first_batch() -> None:
 
 def test_max_across_ranks_int_returns_local_without_dist() -> None:
     assert _max_across_ranks_int(3, torch.device("cpu")) == 3
+
+
+def test_standalone_resume_input_path_prefers_raw_hidden_directory(
+    tmp_path,
+) -> None:
+    data_dir = tmp_path / "raw"
+    data_dir.mkdir()
+    metadata_path = data_dir / "metadata.json"
+    metadata_path.write_text("{}\n", encoding="utf-8")
+    manifest_path = data_dir / "manifest.jsonl"
+    manifest_path.write_text("{}\n", encoding="utf-8")
+
+    assert (
+        _standalone_resume_input_path(
+            {}, "torch_shard", {"path": str(data_dir)}
+        )
+        == str(data_dir)
+    )
+
+    metadata_path.unlink()
+    assert (
+        _standalone_resume_input_path(
+            {}, "torch_shard", {"path": str(data_dir)}
+        )
+        == str(manifest_path)
+    )
+
+
+def test_resolve_input_fingerprint_without_dist(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(
+        "verl_speco.trainer.draft_training_loop.dist.is_initialized",
+        lambda: False,
+    )
+    path = tmp_path / "data.jsonl"
+    path.write_text("{}\n", encoding="utf-8")
+
+    fingerprint = _resolve_input_fingerprint(str(path), rank=0)
+
+    assert fingerprint == build_input_fingerprint(path)
