@@ -24,11 +24,7 @@ class _ReferenceLeaseJournal:
 
     def __init__(self, path, run_id, incarnation):
         path = Path(path).expanduser()
-        if (
-            not path.is_absolute()
-            or path.is_symlink()
-            or (path.exists() and not path.is_file())
-        ):
+        if not path.is_absolute():
             raise ValueError(
                 "Reference lease journal requires an absolute regular-file path"
             )
@@ -53,6 +49,12 @@ class _ReferenceLeaseJournal:
         self._files = ExitStack()
         try:
             _, parent = self._files.enter_context(regular_parent(path))
+            # Check directory access before inspecting its child: a directory
+            # without owner execute permission makes even lstat fail with EACCES.
+            if path.is_symlink() or (path.exists() and not path.is_file()):
+                raise ValueError(
+                    "Reference lease journal requires an absolute regular-file path"
+                )
             fd = os.open(
                 path.name if parent is not None else path,
                 os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0),
