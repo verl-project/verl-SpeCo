@@ -722,12 +722,15 @@ directory as the target model path. Saved-hidden `metadata.json` and
 `speco.standalone_tq_producer.reference_lease_journal_path` is optional. On POSIX
 it requires Linux with `/proc/self/fd` mounted. Put the SQLite file in an absolute,
 symlink-free directory owned by the training user with exactly mode `0700`.
-With the target vLLM service already running, create a new private directory and
+With the target vLLM service already running, create or secure a dedicated private
+directory. Set `SPECO_VLLM_ENDPOINTS` to that service's actual host and port, and
 pass the complete SQLite path together with reference credits and rank acknowledgements:
 
 ```bash
-mkdir -m 700 /tmp/speco-leases
-MODEL_PATH=/path/to/Qwen3-8B \
+mkdir -p /tmp/speco-leases
+chmod 700 /tmp/speco-leases
+SPECO_VLLM_ENDPOINTS='[http://<host>:<port>/v1]' \
+  MODEL_PATH=/path/to/Qwen3-8B \
   TRAIN_FILE=/path/to/train.jsonl \
   DRAFT_CKPTS_DIR=/path/to/dspark-checkpoints \
   bash examples/run_qwen3-8b_drafter_dspark_separate_training.sh \
