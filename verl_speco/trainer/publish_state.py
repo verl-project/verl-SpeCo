@@ -121,6 +121,9 @@ def export_fsdp2_publish_state(
             result[name] = value
             copied_bytes += value.numel() * value.element_size()
             host_copy_s += time.perf_counter() - copy_started
+        # Release the gathered device tensor before materializing the next one.
+        # The selected map retains only the original distributed shards.
+        del tensor
     # The CPU snapshot must be complete before serialization or later training.
     wait_started = time.perf_counter()
     for device in async_devices:

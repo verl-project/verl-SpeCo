@@ -23,6 +23,9 @@ on:
           - examples/dspark_mrv2/run_qwen3-8b_drafter_dspark_colocate_async_vllm_npu.sh
           - examples/dspark_mrv2/run_qwen3-8b_drafter_dspark_separate_async_vllm_npu.sh
           - examples/dspark_mrv2/run_qwen3-8b_drafter_dspark_vllm_npu.sh
+          - examples/glm53-train/glm53_hidden_serve_node0.sh
+          - examples/glm53-train/glm53_hidden_serve_node1.sh
+          - examples/glm53-train/run_glm53_drafter_dspark_separate_training.sh
           - examples/run_dsv4-flash_drafter_dspark_separate_training.sh
           - examples/run_qwen3-4b_actor_fsdp_drafter_dspark_sft.sh
           - examples/run_qwen3-4b_actor_megatron_drafter_eagle3_vllm.sh
@@ -37,6 +40,11 @@ on:
           - examples/run_qwen3-8b_drafter_dflash2_vllm.sh
           - examples/run_qwen3-8b_drafter_dflash_sglang.sh
           - examples/run_qwen3-8b_drafter_dflash_vllm.sh
+          - examples/run_qwen3-8b-opd_drafter_dflash_vllm.sh
+          - examples/run_qwen3-8b-opd_drafter_dspark_vllm.sh
+          - examples/run_qwen3-8b-specopd_drafter_dspark_vllm_npu.sh
+          - examples/run_qwen3-8b-vat_drafter_dflash_vllm.sh
+          - examples/run_qwen3-8b-vat_drafter_dspark_vllm.sh
           - examples/run_qwen3-8b_drafter_dflash_vllm_npu.sh
           - examples/run_qwen3-8b_drafter_domino_peagle_separate_training.sh
           - examples/run_qwen3-8b_drafter_dspark_separate_training.sh
@@ -58,7 +66,7 @@ on:
         default: swr.cn-north-4.myhuaweicloud.com/mindspeed/verl0.8.0_vllm_910b_speco:v1
         type: string
       verl_ref:
-        description: Supported upstream verl release matching the runtime
+        description: Supported upstream verl release matching the runtime (SpecOPD uses release/v0.9.0)
         required: true
         default: release/v0.8.0
         type: choice
@@ -185,6 +193,8 @@ jobs:
     if: needs.select.outputs.platform == 'npu'
     runs-on: [linux-aarch64-a2-8]
     environment: speco-npu-ci
+    env:
+      SPECO_EXAMPLE_VERL_REF: ${{ inputs.example == 'examples/run_qwen3-8b-specopd_drafter_dspark_vllm_npu.sh' && 'release/v0.9.0' || inputs.verl_ref }}
     timeout-minutes: 180
     container:
       image: ${{ inputs.npu_image }}
@@ -198,7 +208,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: verl-project/verl
-          ref: ${{ inputs.verl_ref }}
+          ref: ${{ env.SPECO_EXAMPLE_VERL_REF }}
           path: upstream-verl
       - name: Install checkouts and verify runtime
         shell: bash
@@ -206,7 +216,7 @@ jobs:
           set -euo pipefail
           command -v uv >/dev/null || python -m pip install uv
           uv pip install --system --no-deps -e upstream-verl -e .
-          python ci/verify_checkouts.py --expected-ref "${{ inputs.verl_ref }}"
+          python ci/verify_checkouts.py --expected-ref "$SPECO_EXAMPLE_VERL_REF"
           python -c "import torch, torch_npu; assert torch.npu.is_available()"
       - name: Run selected end-to-end example
         env:

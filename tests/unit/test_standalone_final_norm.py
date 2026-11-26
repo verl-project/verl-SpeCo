@@ -289,26 +289,17 @@ def test_dspark_forward_selects_target_positions_before_norm(apply_norm):
     namespace = {
         "torch": torch, "Optional": Optional,
         "gather_aligned_target_hidden": gather_aligned_target_hidden,
-        "_resolve_sliding_windows": lambda config: None,
-        "build_dflash_attention_masks": lambda **kwargs: (None, None),
     }
     ast.fix_missing_locations(forward)
     exec(compile(ast.Module(body=[gather, forward], type_ignores=[]), str(source), "exec"), namespace)
 
-    class Draft:
-        config = {}
-
-        def extract_context_feature(self, hidden):
-            return hidden[0]
-
-        def __call__(self, **kwargs):
-            return torch.zeros(1, 1, 2, 2)
-
     trainer = SimpleNamespace(
-        _debug_forward_count=0, draft_model=Draft(), block_size=2,
+        _debug_forward_count=0,
+        draft_model=SimpleNamespace(extract_context_feature=lambda hidden: hidden[0]),
+        block_size=2,
+        opd_objective=None,
         _sample_anchor_positions=lambda *a, **kw: (torch.tensor([[0]]), torch.tensor([[True]])),
-        _create_noise_embed=lambda *a: torch.zeros(1, 1, 2, 2),
-        _create_position_ids=lambda *a: (torch.arange(3), torch.arange(2)),
+        _forward_anchor_blocks=lambda *a, **kw: torch.zeros(1, 1, 2, 2),
         _build_label_tensors=lambda **kw: (
             torch.zeros(1, 1, 2, dtype=torch.long), torch.zeros(1, 1, 2, dtype=torch.long),
             torch.ones(1, 1, 2, dtype=torch.bool), torch.tensor([[[1, 3]]]),

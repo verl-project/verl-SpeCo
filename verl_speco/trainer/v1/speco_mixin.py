@@ -27,7 +27,11 @@ from typing import Any, cast
 
 from verl_speco.trainer.bubble_lifecycle import BUBBLE_RUNTIME_FIELDS
 from verl_speco.trainer.v1.bubble_mixin import V1BubbleMixin
+from verl_speco.trainer.v1 import specopd_adapter
 from verl_speco.rl_insight_bridge import trace_state as _rl_insight_trace_state
+
+from verl_speco.integration.specopd_protocol import PROPOSAL_KEY
+from verl_speco.integration.verify_trace import TRACE_KEY
 
 logger = logging.getLogger(__name__)
 
@@ -1105,6 +1109,15 @@ class SpecoV1Mixin(V1BubbleMixin):
         }
 
     def on_step_end(self):
+        if specopd_adapter.enabled(self):
+            result = super().on_step_end()
+            value = specopd_adapter.driver(self)
+            value.finish_step()
+            self._pending_sync_metrics = {
+                **(getattr(self, "_pending_sync_metrics", None) or {}),
+                **value.metrics,
+            }
+            return result
         if self._speco_rollout_idle_worker_enabled():
             started = time.perf_counter()
             upstream_seconds = 0.0
@@ -1512,8 +1525,11 @@ class SpecoV1Mixin(V1BubbleMixin):
             for index in range(len(request_fields))
         ]
         result.meta_info["speco_v1_padding_rows"] = sum(padding)
+        result.non_tensor_batch["_specopd_padding"] = np.asarray(padding, dtype=bool)
         for key in (
+            PROPOSAL_KEY,
             "_verl_request_mean_accept_len",
+            TRACE_KEY,
             "_speco_vllm_request_id",
             "_speco_vllm_request_verify_rounds",
             "_speco_vllm_request_accepted_tokens",
@@ -1580,6 +1596,10 @@ class SpecoV1Mixin(V1BubbleMixin):
             self._speco_populate_request_accept_len_records(evidence)
 
     def _compute_old_log_prob(self, batch, metrics):
+        if specopd_adapter.enabled(self):
+            if specopd_adapter.driver(self).update_due:
+                return specopd_adapter.old_log_prob(self, batch, metrics)
+            return super()._compute_old_log_prob(batch, metrics)
         evidence = None
         if self._speco_rollout_idle_worker_enabled():
             _, evidence = self._speco_v1_batch_data(batch)
@@ -2106,6 +2126,19 @@ class SpecoV1Mixin(V1BubbleMixin):
         return result
 
     def _update_actor(self, batch, metrics):
+        if specopd_adapter.enabled(self):
+            value = specopd_adapter.driver(self)
+            drafter_started = time.perf_counter()
+            value.before_actor_update()
+            actor_started = time.perf_counter()
+            result = super()._update_actor(batch, metrics)
+            actor_elapsed = time.perf_counter() - actor_started
+            metrics.update(value.metrics)
+            metrics["timing_s/actor_update_without_drafter"] = actor_elapsed
+            metrics["timing_s/specopd_before_actor_update"] = (
+                actor_started - drafter_started
+            )
+            return result
         if not self._speco_online_enabled_from_config(self.config):
             return super()._update_actor(batch, metrics)
         if self._speco_rollout_idle_worker_enabled():
@@ -2269,6 +2302,11 @@ class SpecoV1Mixin(V1BubbleMixin):
             time.perf_counter() - started,
         )
 
+    def _submit_batch_to_rollout(self, batch):
+        if specopd_adapter.enabled(self):
+            batch = specopd_adapter.prepare_rollout(self, batch)
+        return super()._submit_batch_to_rollout(batch)
+
     def prepare_for_fit(self, agent_loop_manager) -> None:
         """Run expensive V1 activation/warmup before entering trainer.fit()."""
 
@@ -2325,6 +2363,8 @@ class SpecoV1Mixin(V1BubbleMixin):
                 )
         if self._speco_v1_async_rollout_enabled():
             self._speco_run_async_prefit_rollout_warmup(agent_loop_manager)
+        if specopd_adapter.enabled(self):
+            specopd_adapter.driver(self).bootstrap()
         self._speco_prepared_for_fit = True
 
     def _reissue_inflight_prompts(self, *args, **kwargs):

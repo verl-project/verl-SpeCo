@@ -17,6 +17,7 @@ import dataclasses
 import hashlib
 import json
 import logging
+
 import math
 import os
 import time
@@ -135,6 +136,8 @@ from verl_speco.trainer.scheduler import (
 from verl_speco.workers import SpecoWorker
 
 
+from verl_speco.integration.verify_trace import TRACE_KEY
+
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
@@ -200,6 +203,7 @@ _POLICY_MODEL_NON_TENSOR_KEYS = {
     "_speco_vllm_request_completion_index",
     "_speco_vllm_request_elapsed_sec",
     "_verl_request_mean_accept_len",
+    TRACE_KEY,
 }
 
 
@@ -5192,7 +5196,11 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             prompt_len = int(
                 attention_mask[batch_idx, :prompt_width].detach().sum().item()
             )
-            if response_mask is not None:
+            if training_cfg.get("drafter_opd", {}).get("enable", False):
+                response_len = int(
+                    attention_mask[batch_idx, prompt_width:].detach().sum().item()
+                )
+            elif response_mask is not None:
                 response_len = int(response_mask[batch_idx].detach().sum().item())
             else:
                 response_len = int(
@@ -5743,7 +5751,16 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 payload_bytes += _speco_ref_meta_nbytes(ref_meta)
             owner = int(owner_rank[batch_idx].item())
             prompt_mask = attention_mask[batch_idx, : prompts.size(1)].bool()
-            if response_mask_tensor is not None:
+            opd_enabled = (
+                self._speco_drafter_training_config()
+                .get("drafter_opd", {})
+                .get("enable", False)
+            )
+            if opd_enabled:
+                response_mask = attention_mask[
+                    batch_idx, prompts.size(1) : prompts.size(1) + responses.size(1)
+                ].bool()
+            elif response_mask_tensor is not None:
                 response_mask = response_mask_tensor[batch_idx].bool()
             else:
                 response_mask = attention_mask[
@@ -5770,6 +5787,26 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                     f"{response_len}:{int(valid_positions[0].item())}"
                 ),
             }
+            if opd_enabled:
+                traces = batch.non_tensor_batch.get(TRACE_KEY)
+                if traces is None or traces[batch_idx] is None:
+                    request_id = (
+                        request_ids[batch_idx] if request_ids is not None else None
+                    )
+                    raise ValueError(
+                        "Draft-OPD verification trace missing at old-logprob collection "
+                        f"before worker dispatch: step={self.global_steps}, "
+                        f"batch_idx={batch_idx}, request_id={request_id}, "
+                        f"trace_column_present={traces is not None}. "
+                        "Check vLLM scheduler capture and agent-loop trace transport."
+                    )
+                sample[TRACE_KEY] = traces[batch_idx]
+                sample["response_mask"] = (
+                    response_mask_tensor[batch_idx][response_mask][:response_len]
+                    .detach()
+                    .cpu()
+                    .unsqueeze(0)
+                )
             if hard_sampling_enabled:
                 if isinstance(request_ids, (list, tuple)) and batch_idx < len(
                     request_ids
@@ -7752,7 +7789,14 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             metrics.update(snapshot_metrics)
             self._speco_publish_snapshot_prefetch_metrics = {}
         if getattr(self, "_speco_ci_result", None) is not None:
-            self._speco_ci_result.record_metrics(metrics)
+            from verl_speco.specopd_config import (
+                spec_opd_enabled,
+                specopd_training_config,
+            )
+
+            # SpecOPD records its update and acknowledged publication together.
+            if not spec_opd_enabled(specopd_training_config(self.config)):
+                self._speco_ci_result.record_metrics(metrics)
         return metrics
 
     def _speco_update_output_metrics(self, output: Any, metrics: dict[str, Any]):

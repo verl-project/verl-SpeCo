@@ -183,6 +183,25 @@ def configure_phase_diagnostic_runtime_env(config) -> None:
         )
 
 
+def configure_drafter_runtime_env(config) -> dict[str, str]:
+    """Give every Ray child the resolved drafter config before worker imports."""
+    import json
+    from omegaconf import OmegaConf
+    from verl_speco.integration.drafter_config_env import SPECO_DRAFTER_CONFIG_ENV
+
+    drafter = _config_get(config, "actor_rollout_ref", "rollout", "drafter")
+    if not drafter or not drafter.get("enable", False):
+        return {}
+    payload = json.dumps(OmegaConf.to_container(drafter, resolve=True), sort_keys=True)
+    OmegaConf.update(
+        config,
+        f"ray_kwargs.ray_init.runtime_env.env_vars.{SPECO_DRAFTER_CONFIG_ENV}",
+        payload,
+        force_add=True,
+    )
+    return {SPECO_DRAFTER_CONFIG_ENV: payload}
+
+
 def configure_compile_cache_runtime_env(config) -> dict[str, str]:
     """Forward explicit compiler cache paths; never choose or create a directory."""
     from omegaconf import OmegaConf
@@ -358,6 +377,7 @@ def run(config) -> None:
     configure_phase_diagnostic_runtime_env(config)
     runner = ray.remote(num_cpus=1)(SpecoTaskRunner)
     diagnostic_env = {
+        **configure_drafter_runtime_env(config),
         **configure_compile_cache_runtime_env(config),
         **drafter_diagnostic_env(),
     }

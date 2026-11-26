@@ -18,6 +18,7 @@ with an allow-list for exceptions.
 """
 
 import sys
+import subprocess
 from pathlib import Path
 
 # === CONFIGURATION ===
@@ -59,15 +60,17 @@ def main():
 
     missing = []
 
-    # Gather all .md and .rst files under docs/
-    for ext in ("*.md", "*.rst"):
-        for path in DOCS_DIR.rglob(ext):
-            if is_allowed(path):
-                continue
-
-            text = path.read_text(encoding="utf-8", errors="ignore")
-            if "Last updated" not in text:
-                missing.append(path)
+    result = subprocess.run(
+        ["git", "ls-files", "--cached", "--others", "--exclude-standard", "-z", "--", str(DOCS_DIR)],
+        capture_output=True, text=True, encoding="utf-8", check=True,
+    )
+    for filename in sorted(set(result.stdout.split("\0")) - {""}):
+        path = Path(filename)
+        if not path.is_file() or path.suffix not in {".md", ".rst"} or is_allowed(path):
+            continue
+        text = path.read_text(encoding="utf-8", errors="ignore")
+        if "Last updated" not in text:
+            missing.append(path)
 
     # Report
     if missing:

@@ -385,6 +385,58 @@ def test_example_runner_dry_run_covers_npu_dspark() -> None:
     assert "actor_rollout_ref.rollout.drafter.rollout.spec_verify_tokens=7" in stdout
 
 
+def test_npu_workflow_uses_container_independent_result_paths() -> None:
+    workflow = _workflow("npu_vllm_unit_tests.yml")
+    steps = {step["name"]: step for step in workflow["jobs"]["example"]["steps"]}
+    result = "outputs/npu-ci/${{ matrix.drafter }}/result.json"
+    assert steps["Run example script"]["env"]["SPECO_CI_RESULT_PATH"] == result
+    # Absolute github.workspace paths differ between the host and job container;
+    # the runner's container hook only rewrites the first path in a multiline value.
+    assert steps["Upload CI result"]["with"]["path"].splitlines() == [
+        result,
+        result + ".log",
+        result + ".timing.json",
+        "outputs/npu-ci/${{ matrix.drafter }}/diagnostics/",
+    ]
+    assert 'output="outputs/npu-ci/' in steps["Collect runtime diagnostics"]["run"]
+
+
+@pytest.mark.parametrize("drafter", ["eagle3", "dflash", "dspark"])
+def test_npu_workflow_default_topology_and_configured_device_count(drafter) -> None:
+    workflow = _workflow("npu_vllm_unit_tests.yml")
+    count = workflow["on"]["workflow_dispatch"]["inputs"]["accelerator_count"][
+        "default"
+    ]
+    assert count == "8"
+    matrix = workflow["jobs"]["example"]["strategy"]["matrix"]["include"]
+    case = next(entry for entry in matrix if entry["drafter"] == drafter)
+    tensor_parallel_size = case.get("tensor_parallel_size", "1")
+    assert tensor_parallel_size == ("2" if drafter == "dspark" else "1")
+    stdout = _dry_run(
+        drafter,
+        platform="npu",
+        accelerator_count=count,
+        tensor_parallel_size=tensor_parallel_size,
+    )
+    assert "trainer.n_gpus_per_node=8" in stdout
+    assert f"actor_rollout_ref.rollout.tensor_model_parallel_size={tensor_parallel_size}" in stdout
+    assert "ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7" in stdout
+    configured = _dry_run(drafter, platform="npu", accelerator_count="4")
+    assert "trainer.n_gpus_per_node=4" in configured
+    assert "ASCEND_RT_VISIBLE_DEVICES=0,1,2,3" in configured
+
+
+def test_npu_smoke_bounds_dataset_filter_workers_and_preserves_overrides():
+    stdout = _dry_run("dspark", platform="npu")
+    assert "data.filter_overlong_prompts_workers=1" in stdout
+    configured = _dry_run(
+        "dspark",
+        platform="npu",
+        ci_variables='{"SPECO_FILTER_OVERLONG_PROMPTS_WORKERS":"3"}',
+    )
+    assert "data.filter_overlong_prompts_workers=3" in configured
+
+
 def test_example_runner_dry_run_omits_ulysses_overrides_for_npu_megatron() -> None:
     stdout = _dry_run("megatron-eagle3", platform="npu", accelerator_count="8")
 
@@ -404,6 +456,7 @@ def _dry_run(
     accelerator_count: str = "1",
     extra_hydra_args: str | None = None,
     ci_variables: str | None = None,
+    tensor_parallel_size: str = "1",
 ) -> str:
     """Dump the Hydra overrides the runner would pass, without launching a job."""
     bash = _require_working_bash()
@@ -417,6 +470,7 @@ def _dry_run(
         "SPECO_TEST_FILE": "/data/test.parquet",
         "SPECO_CKPT_DIR": "/tmp/speco",
         "SPECO_ACCELERATOR_COUNT": accelerator_count,
+        "SPECO_TENSOR_PARALLEL_SIZE": tensor_parallel_size,
     }
     if extra_hydra_args is not None:
         env["SPECO_EXTRA_HYDRA_ARGS"] = extra_hydra_args

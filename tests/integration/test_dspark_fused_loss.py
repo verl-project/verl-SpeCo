@@ -83,3 +83,33 @@ def test_fused_tv_matches_eager_forward_and_draft_backward() -> None:
         fused_draft.grad, eager_draft.grad, atol=3e-5, rtol=3e-5
     )
     assert target.grad is None
+
+
+@pytest.mark.parametrize("use_l1", [False, True])
+def test_joint_teacher_ce_matches_weighted_eager_specopd(use_l1) -> None:
+    from verl_speco.backends.specopd_loss import specopd_distribution_loss
+
+    device = _accelerator_device()
+    capability = fused_loss_capability(device)
+    if not capability.available:
+        pytest.skip(capability.reason)
+    torch.manual_seed(28)
+    q = torch.randn(2, 3, 16385, device=device)
+    p = torch.randn_like(q)
+    # A tie spanning vocabulary tiles must use the first teacher label.
+    p[..., 7] = p[..., -1] = 12.0
+    p.requires_grad_()
+    valid = torch.tensor([[True, True, True], [True, False, False]], device=device)
+    weights = torch.tensor([[1.0, 2.0, 1.0], [0.6, 0.0, 0.0]], device=device)
+    out = []
+    for mode in ("eager", "fused"):
+        logits = q.clone().requires_grad_()
+        loss, count, _ = specopd_distribution_loss(
+            logits, p, valid, use_l1=use_l1, position_weights=weights,
+            distribution_weight=0.9, ce_weight=0.1, distribution_loss_impl=mode,
+        )
+        grad, = torch.autograd.grad(loss / count, logits)
+        out.append((loss, count, grad))
+    torch.testing.assert_close(out[0], out[1], atol=3e-5, rtol=3e-5)
+    assert out[1][2][1, 1:].abs().sum() == 0
+    assert p.grad is None

@@ -64,9 +64,8 @@ on:
         default: "8"
         type: string
       tensor_parallel_size:
-        description: Rollout tensor parallel size
+        description: Rollout tensor parallel size (defaults to the selected drafter's CI topology)
         required: false
-        default: "1"
         type: string
       sequence_parallel_size:
         description: Actor/ref sequence parallel size
@@ -122,6 +121,8 @@ jobs:
           - drafter: dspark
             enable_training: true
             disable_eagle3_torch_compile: false
+            # Match the DSpark example's TP and reduce host memory at draft publication.
+            tensor_parallel_size: '2'
 
     steps:
       - name: Check out verl-SpeCo
@@ -220,10 +221,10 @@ jobs:
           SPECO_DSPARK_DRAFT_MODEL: ${{ inputs.dspark_draft_model || env.SPECO_DEFAULT_DSPARK_DRAFT_MODEL }}
           SPECO_TRAIN_FILE: ${{ inputs.train_file || env.SPECO_DEFAULT_TRAIN_FILE }}
           SPECO_TEST_FILE: ${{ inputs.test_file || env.SPECO_DEFAULT_TEST_FILE }}
-          SPECO_CI_RESULT_PATH: ${{ runner.temp }}/speco-ci-${{ matrix.drafter }}.json
-          SPECO_CKPT_DIR: ${{ vars.SPECO_CKPT_DIR || runner.temp }}
+          SPECO_CI_RESULT_PATH: outputs/npu-ci/${{ matrix.drafter }}/result.json
+          SPECO_CKPT_DIR: ${{ vars.SPECO_CKPT_DIR || format('outputs/npu-ci/{0}/checkpoints', matrix.drafter) }}
           SPECO_ACCELERATOR_COUNT: ${{ inputs.accelerator_count || env.SPECO_DEFAULT_ACCELERATOR_COUNT }}
-          SPECO_TENSOR_PARALLEL_SIZE: ${{ inputs.tensor_parallel_size || env.SPECO_DEFAULT_TENSOR_PARALLEL_SIZE }}
+          SPECO_TENSOR_PARALLEL_SIZE: ${{ inputs.tensor_parallel_size || vars.SPECO_TENSOR_PARALLEL_SIZE || matrix.tensor_parallel_size || env.SPECO_DEFAULT_TENSOR_PARALLEL_SIZE }}
           SPECO_SEQUENCE_PARALLEL_SIZE: ${{ inputs.sequence_parallel_size || env.SPECO_DEFAULT_SEQUENCE_PARALLEL_SIZE }}
           SPECO_ENABLE_TRAINING: ${{ matrix.enable_training && (github.event_name != 'workflow_dispatch' || inputs.run_training) && 'true' || 'false' }}
           SPECO_CI_VARIABLES_JSON: ${{ toJSON(vars) }}
@@ -246,13 +247,37 @@ jobs:
           SPECO_EXTRA_HYDRA_ARGS: ${{ inputs.extra_hydra_args || vars.SPECO_EXTRA_HYDRA_ARGS }}
         run: bash ci/run_example_test.sh npu vllm "${{ matrix.drafter }}"
 
+      - name: Collect runtime diagnostics
+        if: always()
+        shell: bash
+        run: |
+          output="outputs/npu-ci/${{ matrix.drafter }}/diagnostics"
+          mkdir -p "${output}"
+          {
+            df -h /dev/shm
+            ps -eo pid,ppid,rss,comm --sort=-rss | head -n 40 || true
+            for file in /sys/fs/cgroup/memory.events /sys/fs/cgroup/memory.peak /sys/fs/cgroup/memory.max /sys/fs/cgroup/memory/memory.failcnt; do
+              if test -r "${file}"; then
+                echo "${file}"
+                cat "${file}"
+              fi
+            done
+          } > "${output}/resources.txt" 2>&1
+          if test -d /tmp/ray/session_latest/logs; then
+            find /tmp/ray/session_latest/logs -maxdepth 1 -type f \( -name '*.err' -o -name 'raylet.out' -o -name 'python-core-worker*.log' \) -print0 |
+              while IFS= read -r -d '' file; do
+                tail -n 200 "${file}" > "${output}/$(basename "${file}")"
+              done
+          fi
+
       - name: Upload CI result
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: npu_vllm_unit_tests-${{ matrix.drafter }}-result
           path: |
-            ${{ runner.temp }}/speco-ci-${{ matrix.drafter }}.json
-            ${{ runner.temp }}/speco-ci-${{ matrix.drafter }}.json.log
-            ${{ runner.temp }}/speco-ci-${{ matrix.drafter }}.json.timing.json
+            outputs/npu-ci/${{ matrix.drafter }}/result.json
+            outputs/npu-ci/${{ matrix.drafter }}/result.json.log
+            outputs/npu-ci/${{ matrix.drafter }}/result.json.timing.json
+            outputs/npu-ci/${{ matrix.drafter }}/diagnostics/
           if-no-files-found: warn

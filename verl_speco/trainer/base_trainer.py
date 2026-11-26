@@ -59,10 +59,22 @@ from verl_speco.integration.oldlogprob_layer_ids import (
     resolve_drafter_hidden_states_layout,
 )
 
+from verl_speco.integration.verify_trace import TRACE_KEY
+
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
 
 device_name = get_device_name()
+
+_VAT_METRIC_KEYS = (
+    "kd_loss",
+    "accept_loss",
+    "self_cov_loss",
+    "ce_loss",
+    "mean_accepted",
+    "sim_vs_obs_visible_accept_gap",
+)
+_OPD_METRIC_KEYS = ("loss", "trace_blocks", "random_blocks", "visible_tokens")
 
 _ALIGNMENT_DEBUG_ENV = "VERL_DRAFTER_ALIGNMENT_DEBUG"
 _ALIGNMENT_DEBUG_EVERY_N_STEPS_ENV = "VERL_DRAFTER_ALIGNMENT_DEBUG_EVERY_N_STEPS"
@@ -838,6 +850,12 @@ class DrafterBaseTrainer:
             self.training_group_world_size > 1
             and self.ulysses_sequence_parallel_size > 1
         )
+        if self.use_ulysses_sp and training_cfg.get("drafter_opd", {}).get(
+            "enable", False
+        ):
+            raise ValueError(
+                "Draft-OPD does not support Ulysses sequence parallelism > 1"
+            )
         setattr(self.backend, "use_ulysses_sp", self.use_ulysses_sp)
         self.use_native_dp_sp = (
             self.training_group_world_size > 1 and self.dp_group_world_size > 1
@@ -1305,6 +1323,19 @@ class DrafterBaseTrainer:
         prefix = self._block_drafter_metric_prefix()
         if f"{prefix}/loss" in sums:
             metrics[f"{prefix}/loss"] = sums[f"{prefix}/loss"] / steps
+        vat_batches = sums.get(f"{prefix}/vat/batch_count", 0.0)
+        if vat_batches > 0:
+            for key in _VAT_METRIC_KEYS:
+                if f"{prefix}/vat/{key}" in sums:
+                    metrics[f"{prefix}/vat/{key}"] = (
+                        sums[f"{prefix}/vat/{key}"] / vat_batches
+                    )
+        opd_batches = sums.get(f"{prefix}/opd/batch_count", 0.0)
+        if opd_batches > 0:
+            for key in _OPD_METRIC_KEYS:
+                metrics[f"{prefix}/opd/{key}"] = (
+                    sums[f"{prefix}/opd/{key}"] / opd_batches
+                )
         selector_weight = sums.get(f"{prefix}/selector_weight_count", 0.0)
         if selector_weight > 0:
             metrics[f"{prefix}/selector_loss"] = (
@@ -1508,6 +1539,10 @@ class DrafterBaseTrainer:
             "sampled_vocab_size": f"{prefix}/sampled_vocab_size",
             "loss_mode_id": f"{prefix}/loss_mode_id",
         }
+        for key in (*_VAT_METRIC_KEYS, "batch_count"):
+            scalar_keys[f"vat/{key}"] = f"{prefix}/vat/{key}"
+        for key in (*_OPD_METRIC_KEYS, "batch_count"):
+            scalar_keys[f"opd/{key}"] = f"{prefix}/opd/{key}"
         vector_keys = {
             "loss_sum_per_position": f"{prefix}/loss_sum_per_position",
             "correct_per_position": f"{prefix}/correct_per_position",
@@ -2115,17 +2150,20 @@ class DrafterBaseTrainer:
     def _is_frozen_publish_param(self, name: str) -> bool:
         """Return whether a drafter state entry should be excluded from hot publish."""
 
+        if "vat_objective.accept_head." in name:
+            return True
         if any(frozen_name in name for frozen_name in self._frozen_param_names):
             return True
         if (
             getattr(self.backend, "model_type", None) == "dspark"
             and "confidence_head." in name
-            and float(getattr(self.backend, "confidence_head_alpha", 0.0)) <= 0.0
         ):
-            # A checkpoint's untrained head stays frozen. Trained confidence
-            # heads must be published on both MRV1 and MRV2 now that the
-            # runtimes can register and consume them.
-            return True
+            # VAT can train this head with the ordinary confidence loss disabled.
+            draft_model, _ = self._get_pretrained_export_model()
+            return not any(
+                param.requires_grad
+                for param in draft_model.confidence_head.parameters()
+            )
         if name == "embed_tokens.weight" or name.endswith(".embed_tokens.weight"):
             # Most backends seed the draft embedding from the target and freeze it,
             # so the engine already holds the same rows. Backends that fine-tune it
@@ -2604,16 +2642,21 @@ class DrafterBaseTrainer:
         save_error = None
         try:
             import torch.distributed.checkpoint as dcp
+            from verl_speco.trainer.auxiliary_state import DrafterAuxiliaryState
+
+            auxiliary = DrafterAuxiliaryState(self.model)
+            has_auxiliary = bool(auxiliary.state_dict())
 
             dcp.save(
                 {
+                    **({"auxiliary_model": auxiliary} if has_auxiliary else {}),
                     "optimizer": _DrafterOptimizerState(
                         self.model,
                         self.optimizer,
                         self._checkpoint_process_group()
                         if self._use_replica_local_bubble_group()
                         else None,
-                    )
+                    ),
                 },
                 checkpoint_id=temporary_path,
                 process_group=self._checkpoint_process_group(),
@@ -2651,6 +2694,8 @@ class DrafterBaseTrainer:
                 self.fsdp_device_mesh.size() if self.fsdp_device_mesh is not None else 1
             ),
         }
+        if has_auxiliary:
+            manifest["auxiliary_model"] = True
         if is_leader:
             try:
                 total_bytes = sum(
@@ -2686,6 +2731,21 @@ class DrafterBaseTrainer:
 
         try:
             import torch.distributed.checkpoint as dcp
+            from verl_speco.trainer.auxiliary_state import DrafterAuxiliaryState
+
+            auxiliary = DrafterAuxiliaryState(self.model)
+            if auxiliary.state_dict():
+                if not metadata["optimizer"].get("auxiliary_model", False):
+                    raise ValueError(
+                        "Checkpoint is missing VAT acceptance-head weights; "
+                        "disable resume_trainer_state_from_checkpoint to start fresh"
+                    )
+                # Restore auxiliary parameters before applying their optimizer moments.
+                dcp.load(
+                    {"auxiliary_model": auxiliary},
+                    checkpoint_id=optimizer_path,
+                    process_group=self._checkpoint_process_group(),
+                )
 
             dcp.load(
                 {
@@ -4669,6 +4729,7 @@ class DrafterBaseTrainer:
                     batch.get("_verl_request_mean_accept_len"),
                     i,
                 ),
+                TRACE_KEY: _batch_item_value(batch.get(TRACE_KEY), i),
                 "_speco_vllm_request_id": _batch_item_value(
                     batch.get("_speco_vllm_request_id"), i
                 ),
@@ -4716,6 +4777,25 @@ class DrafterBaseTrainer:
                     else None
                 ),
             }
+            if data_item[TRACE_KEY] is not None:
+                from verl_speco.integration.verify_trace import align_trace_to_prompt
+
+                if cpu_prompts is None:
+                    raise ValueError(
+                        "Draft-OPD collection requires prompt token coordinates"
+                    )
+                data_item[TRACE_KEY] = align_trace_to_prompt(
+                    data_item[TRACE_KEY], cpu_prompts[i].numel()
+                )
+                if batch.get("response_mask") is None:
+                    raise ValueError(
+                        "Draft-OPD collection requires the agent response_mask"
+                    )
+                response_mask = (
+                    batch["response_mask"][i].detach().cpu().float()[:response_len]
+                )
+                full_loss_mask[prompt_len : prompt_len + response_len] = response_mask
+                data_item["loss_mask"] = full_loss_mask[feature_start:feature_end]
             if shifted_block_labels:
                 if not 0 <= feature_start < feature_end < input_seq_length:
                     raise ValueError(
@@ -5646,6 +5726,8 @@ class DrafterBaseTrainer:
         packed_loss_tokens = 0
         trailing_label_rows = 0
         packing_enabled = self._packing_enabled()
+        if packing_enabled and "opd_trace" in preprocessed_lists:
+            raise ValueError("Draft-OPD currently requires packing=false")
 
         # Build training chunks inside each sample before packing. EAGLE3-style
         # models use next-token chunks, while DFlash keeps same-position blocks
@@ -5663,6 +5745,7 @@ class DrafterBaseTrainer:
         label_id_chunks = []
         label_mask_chunks = []
 
+        opd_trace_chunks = []
         ids_list = preprocessed_lists["ids"]
         hidden_list = preprocessed_lists["h_states"]
         mask_list = preprocessed_lists["masks"]
@@ -6116,6 +6199,10 @@ class DrafterBaseTrainer:
                             },
                         )
 
+            if "opd_trace" in preprocessed_lists:
+                opd_trace_chunks.append(
+                    preprocessed_lists["opd_trace"][item_idx][:train_seq_len]
+                )
             if uses_shifted_eagle_inputs or self.backend.model_type == "peagle":
                 input_id_chunks.append(ids[1 : 1 + train_seq_len])
                 hidden_state_chunks.append(h_states[:train_seq_len])
@@ -6542,6 +6629,12 @@ class DrafterBaseTrainer:
             and target_last_hidden_state_chunks
         ):
             batch["target_last_hidden_states"] = target_last_hidden_states
+        if opd_trace_chunks:
+            batch["opd_trace"] = torch.full(
+                (*input_ids.shape, 3), -1, dtype=torch.long, device=dev
+            )
+            for row, trace in enumerate(opd_trace_chunks):
+                batch["opd_trace"][row, : trace.size(0)] = trace
         if document_ids is not None:
             batch["document_ids"] = document_ids
         batch["_speco_pad_size"] = pad_size_for_batch
@@ -7230,6 +7323,107 @@ class DrafterBaseTrainer:
             self._active_training_target_version = previous_target_version
             self._last_prepared_training_items = previous_prepared_items
 
+    async def training_specopd_group(self, group):
+        """Consume exactly the CPU plan acknowledged by every training rank."""
+        from verl_speco.backends.specopd_forward import (
+            prepare_specopd_training_batches,
+            partition_specopd_samples,
+        )
+        from verl_speco.integration.specopd_collectives import (
+            warm_specopd_training_collectives,
+        )
+
+        step, _, feature_indices = group.key
+        spec, group_sizes = group.spec, group.group_sizes
+        warm_specopd_training_collectives(self, step=step)
+        if group.positions < spec.min_scored_positions_per_update:
+            return False
+        self._specopd_group_metrics = {}
+        activation_started = time.perf_counter()
+        if not await self.activate_training_model():
+            raise RuntimeError("SpecOPD drafter activation failed")
+        self._specopd_group_metrics["timing_s/specopd_activation"] = (
+            time.perf_counter() - activation_started
+        )
+        wrapper = self.model.module if hasattr(self.model, "module") else self.model
+        layers = wrapper.draft_model.num_context_layers
+        if len(feature_indices) != layers:
+            raise ValueError(
+                "SpecOPD auxiliary layer count differs from drafter checkpoint"
+            )
+        if float(getattr(wrapper.draft_model.config, "attention_dropout", 0.0)) != 0:
+            raise ValueError(
+                "SpecOPD fixed-history probability reconstruction requires zero draft dropout"
+            )
+        prepare_started = time.perf_counter()
+        dp_rank = self._get_dp_local_rank()
+        dp_size = self._get_dp_world_size()
+        selected, real_slots = partition_specopd_samples(
+            group.samples, dp_rank, dp_size
+        )
+        batches, cache_bytes = prepare_specopd_training_batches(
+            selected,
+            self.runtime_device,
+            cache_bytes=spec.training_input_cache_mib * 1024**2,
+            group_sizes=group_sizes,
+            real_slots=real_slots,
+        )
+        self._specopd_group_metrics.update(
+            {
+                "timing_s/specopd_prepare": time.perf_counter() - prepare_started,
+                "specopd/prepared_batches": len(batches),
+                "specopd/train_microbatch_trajectories": max(group_sizes),
+                "specopd/train_dp_size": dp_size,
+                "specopd/input_cache_bytes": cache_bytes,
+            }
+        )
+        optimizer_before = self.optimizer_steps_total
+        train_started = time.perf_counter()
+        batch_options = spec.batch_options
+        for _ in range(spec.optimizer_updates_per_collection):
+            for index, prepared in enumerate(batches):
+                batch = {
+                    key: value.to(self.runtime_device)
+                    if torch.is_tensor(value)
+                    else value
+                    for key, value in prepared.items()
+                }
+                batch.update(batch_options)
+                with torch.enable_grad():
+                    ok = await self._training_step_on_batch(
+                        batch,
+                        step,
+                        accumulation_steps=len(batches),
+                        accumulation_index=index,
+                    )
+                # Backward has consumed this microbatch. Release uncached device
+                # inputs before staging the next one, rather than retaining both
+                # input sets while the next dict comprehension evaluates .to().
+                del batch
+                if not ok:
+                    self.optimizer.zero_grad(set_to_none=True)
+                    raise RuntimeError(
+                        "SpecOPD update failed; this group must not be replayed"
+                    )
+        self._specopd_group_metrics["timing_s/specopd_train_loop"] = (
+            time.perf_counter() - train_started
+        )
+        if (
+            self.optimizer_steps_total
+            != optimizer_before + spec.optimizer_updates_per_collection
+        ):
+            raise RuntimeError(
+                "SpecOPD group optimizer update count differs from its configuration"
+            )
+        snapshot_started = time.perf_counter()
+        self.prepare_model_state_dict_for_publish(step)
+        self._specopd_group_metrics["timing_s/specopd_snapshot"] = (
+            time.perf_counter() - snapshot_started
+        )
+        # Drop fixed input device tensors before the worker offloads its model.
+        del batches, prepared
+        return True
+
     async def training_step_from_batch(
         self, batch: dict[str, torch.Tensor], step: int, *, raise_on_error: bool = False
     ) -> bool:
@@ -7761,9 +7955,9 @@ class DrafterBaseTrainer:
 
         try:
             training_cfg = self.config.rollout.drafter.training
+
             if (
-                device_name == "cuda"
-                and not getattr(self, "_bubble_time_enabled", False)
+                not getattr(self, "_bubble_time_enabled", False)
                 and self.training_device_mesh is not None
                 and not isinstance(self.model, FSDP)
                 and not self._is_ddp_wrapped()
@@ -8278,7 +8472,9 @@ class DrafterBaseTrainer:
         self._last_ckpt_step = -1
         self.training_steps = 0
 
-    async def release_training_memory_after_activation(self, *, strict: bool = False):
+    async def release_training_memory_after_activation(
+        self, *, strict: bool = False, single_cache_reclaim: bool = False
+    ):
         """Park training tensors on CPU, preserving optimizer and replay progress.
 
         Warmup retains best-effort cleanup. Bubble main-workload boundaries use
@@ -8319,7 +8515,7 @@ class DrafterBaseTrainer:
                     return
             # Reclaim once after model, optimizer and head transfers finish.
             # A pooled copy failure propagates; only a clean decline falls back.
-            if device_name == "cuda":
+            if device_name == "cuda" or single_cache_reclaim:
                 offload_fsdp_model_to_cpu(self.model, empty_cache=False)
             else:
                 offload_fsdp_model_to_cpu(self.model)

@@ -105,6 +105,7 @@ def _validate_logits(logits: torch.Tensor, name: str) -> None:
 if triton is not None:
     _OP_LABEL_CE = tl.constexpr(0)
     _OP_TV = tl.constexpr(1)
+    _OP_TV_CE = tl.constexpr(2)
 
     def _calculate_settings(n_cols: int, device: torch.device) -> tuple[int, int]:
         """Match speculators' deterministic fused-loss launch policy."""
@@ -124,9 +125,12 @@ if triton is not None:
         return block_size, num_warps
 
     @triton.jit
-    def _online_stats(row_ptr, n_cols, BLOCK_SIZE: tl.constexpr):
+    def _online_stats(
+        row_ptr, n_cols, BLOCK_SIZE: tl.constexpr, GET_LABEL: tl.constexpr
+    ):
         m = float("-inf")
         d = 0.0
+        label = 0
         for i in range(0, n_cols, BLOCK_SIZE):
             offsets = i + tl.arange(0, BLOCK_SIZE)
             mask = offsets < n_cols
@@ -134,10 +138,13 @@ if triton is not None:
                 tl.float32
             )
             block_max = tl.max(tl.where(mask, x, float("-inf")))
+            if GET_LABEL:
+                block_label = tl.min(tl.where(mask & (x == block_max), offsets, n_cols))
+                label = tl.where(block_max > m, block_label, label)
             m_new = tl.maximum(m, block_max)
             d = d * tl.exp(m - m_new) + tl.sum(tl.where(mask, tl.exp(x - m_new), 0.0))
             m = m_new
-        return m, d
+        return m, d, label
 
     @triton.jit
     def _loss_forward_kernel(
@@ -145,15 +152,17 @@ if triton is not None:
         targets_ptr,
         labels_ptr,
         loss_ptr,
+        ce_loss_ptr,
         stats_ptr,
         stats_row,
         n_cols,
         OP: tl.constexpr,
+        AVERAGE_TIES: tl.constexpr,
         BLOCK_SIZE: tl.constexpr,
     ):
         pid = tl.program_id(0).to(tl.int64)
         logits_ptr += pid * n_cols
-        m_d, z_d = _online_stats(logits_ptr, n_cols, BLOCK_SIZE)
+        m_d, z_d, _ = _online_stats(logits_ptr, n_cols, BLOCK_SIZE, False)
         lse_d = m_d + tl.log(z_d)
         tl.store(stats_ptr + pid, m_d)
         tl.store(stats_ptr + stats_row + pid, z_d)
@@ -165,7 +174,13 @@ if triton is not None:
             tl.store(stats_ptr + 4 * stats_row + pid, label.to(tl.float32))
         else:
             targets_ptr += pid * n_cols
-            m_t, z_t = _online_stats(targets_ptr, n_cols, BLOCK_SIZE)
+            m_t, z_t, label = _online_stats(
+                targets_ptr, n_cols, BLOCK_SIZE, OP == _OP_TV_CE
+            )
+            if OP == _OP_TV_CE:
+                target_logit = tl.load(logits_ptr + label).cast(tl.float32)
+                tl.store(ce_loss_ptr + pid, lse_d - target_logit)
+                tl.store(stats_ptr + 5 * stats_row + pid, label.to(tl.float32))
             lse_t = m_t + tl.log(z_t)
             tl.store(stats_ptr + 2 * stats_row + pid, m_t)
             tl.store(stats_ptr + 3 * stats_row + pid, z_t)
@@ -181,7 +196,11 @@ if triton is not None:
                 dp = tl.exp(x - lse_d)
                 tp = tl.exp(y - lse_t)
                 overlap += tl.sum(tl.where(mask, tl.minimum(dp, tp), 0.0))
-                draft_small += tl.sum(tl.where(mask & (dp <= tp), dp, 0.0))
+                if AVERAGE_TIES:
+                    selected = tl.where(dp < tp, 1.0, tl.where(dp == tp, 0.5, 0.0))
+                    draft_small += tl.sum(tl.where(mask, selected * dp, 0.0))
+                else:
+                    draft_small += tl.sum(tl.where(mask & (dp <= tp), dp, 0.0))
             tl.store(loss_ptr + pid, 1.0 - overlap)
             tl.store(stats_ptr + 4 * stats_row + pid, draft_small)
 
@@ -191,17 +210,22 @@ if triton is not None:
         targets_ptr,
         grad_in_ptr,
         grad_out_ptr,
+        ce_grad_out_ptr,
         stats_ptr,
         stats_row,
         n_cols,
         OP: tl.constexpr,
+        AVERAGE_TIES: tl.constexpr,
         BLOCK_SIZE: tl.constexpr,
     ):
         pid = tl.program_id(0).to(tl.int64)
         logits_ptr += pid * n_cols
         grad_in_ptr += pid * n_cols
         go = tl.load(grad_out_ptr + pid).cast(tl.float32)
-        if go == 0.0:
+        ce_go = 0.0
+        if OP == _OP_TV_CE:
+            ce_go = tl.load(ce_grad_out_ptr + pid).cast(tl.float32)
+        if go == 0.0 and ce_go == 0.0:
             for i in range(0, n_cols, BLOCK_SIZE):
                 offsets = i + tl.arange(0, BLOCK_SIZE)
                 mask = offsets < n_cols
@@ -211,13 +235,15 @@ if triton is not None:
         z_d = tl.load(stats_ptr + stats_row + pid)
         lse_d = m_d + tl.log(z_d)
         extra = tl.load(stats_ptr + 4 * stats_row + pid)
-        if OP == _OP_TV:
+        if OP != _OP_LABEL_CE:
             targets_ptr += pid * n_cols
             m_t = tl.load(stats_ptr + 2 * stats_row + pid)
             z_t = tl.load(stats_ptr + 3 * stats_row + pid)
             lse_t = m_t + tl.log(z_t)
-        else:
+        if OP == _OP_LABEL_CE:
             target_idx = extra.to(tl.int32)
+        if OP == _OP_TV_CE:
+            target_idx = tl.load(stats_ptr + 5 * stats_row + pid).to(tl.int32)
 
         for i in range(0, n_cols, BLOCK_SIZE):
             offsets = i + tl.arange(0, BLOCK_SIZE)
@@ -231,19 +257,28 @@ if triton is not None:
                     tl.float32
                 )
                 tp = tl.exp(y - lse_t)
-                grad = -dp * ((dp <= tp).to(tl.float32) - extra)
-            tl.store(grad_in_ptr + offsets, go * grad, mask=mask)
+                if AVERAGE_TIES:
+                    selected = tl.where(dp < tp, 1.0, tl.where(dp == tp, 0.5, 0.0))
+                else:
+                    selected = (dp <= tp).to(tl.float32)
+                grad = -dp * (selected - extra)
+            result = go * grad
+            if OP == _OP_TV_CE:
+                result += ce_go * (dp - (offsets == target_idx).to(tl.float32))
+            tl.store(grad_in_ptr + offsets, result, mask=mask)
 
     class _FusedLoss(torch.autograd.Function):
         @staticmethod
-        def forward(ctx, logits, targets, labels, op):
+        def forward(ctx, logits, targets, labels, op, average_ties):
             rows, vocab = logits.shape
             logits_flat = logits.contiguous()
             targets_flat = targets.contiguous() if targets is not None else None
             labels_flat = labels.contiguous() if labels is not None else None
             loss = torch.empty(rows, device=logits.device, dtype=torch.float32)
+            joint = op == _OP_TV_CE.value
+            ce_loss = torch.empty_like(loss) if joint else None
             stats = torch.empty(
-                _N_STATS, rows, device=logits.device, dtype=torch.float32
+                _N_STATS + int(joint), rows, device=logits.device, dtype=torch.float32
             )
             block_size, num_warps = _calculate_settings(vocab, logits.device)
             _loss_forward_kernel[(rows,)](
@@ -251,20 +286,23 @@ if triton is not None:
                 targets_flat,
                 labels_flat,
                 loss,
+                ce_loss,
                 stats,
                 stats.stride(0),
                 vocab,
                 OP=op,
+                AVERAGE_TIES=average_ties,
                 BLOCK_SIZE=block_size,
                 num_warps=num_warps,
             )
             ctx.save_for_backward(logits_flat, targets_flat, stats)
             ctx.op = op
+            ctx.average_ties = average_ties
             ctx.settings = (block_size, num_warps)
-            return loss
+            return (loss, ce_loss) if joint else loss
 
         @staticmethod
-        def backward(ctx, grad_output):
+        def backward(ctx, grad_output, ce_grad_output=None):
             logits, targets, stats = ctx.saved_tensors
             rows, vocab = logits.shape
             block_size, num_warps = ctx.settings
@@ -274,14 +312,16 @@ if triton is not None:
                 targets,
                 grad_logits,
                 grad_output.contiguous(),
+                ce_grad_output.contiguous() if ce_grad_output is not None else None,
                 stats,
                 stats.stride(0),
                 vocab,
                 OP=ctx.op,
+                AVERAGE_TIES=ctx.average_ties,
                 BLOCK_SIZE=block_size,
                 num_warps=num_warps,
             )
-            return grad_logits, None, None, None
+            return grad_logits, None, None, None, None
 
 
 def fused_label_cross_entropy(
@@ -294,11 +334,14 @@ def fused_label_cross_entropy(
         raise ValueError("labels and logits must be on the same device")
     if bool(((labels < 0) | (labels >= logits.size(1))).any()):
         raise ValueError("labels contain an index outside the vocabulary")
-    return _FusedLoss.apply(logits, None, labels, _OP_LABEL_CE.value)
+    return _FusedLoss.apply(logits, None, labels, _OP_LABEL_CE.value, False)
 
 
 def fused_total_variation(
-    draft_logits: torch.Tensor, target_logits: torch.Tensor
+    draft_logits: torch.Tensor,
+    target_logits: torch.Tensor,
+    *,
+    average_ties: bool = False,
 ) -> torch.Tensor:
     _validate_logits(draft_logits, "draft_logits")
     _validate_logits(target_logits, "target_logits")
@@ -306,4 +349,22 @@ def fused_total_variation(
         raise ValueError("draft_logits and target_logits must have identical shapes")
     if draft_logits.device != target_logits.device:
         raise ValueError("draft_logits and target_logits must be on the same device")
-    return _FusedLoss.apply(draft_logits, target_logits.detach(), None, _OP_TV.value)
+    return _FusedLoss.apply(
+        draft_logits, target_logits.detach(), None, _OP_TV.value, average_ties
+    )
+
+
+def fused_total_variation_and_teacher_ce(
+    draft_logits: torch.Tensor, target_logits: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Unit-temperature TV and teacher-top-1 CE with one logits gradient."""
+    _validate_logits(draft_logits, "draft_logits")
+    _validate_logits(target_logits, "target_logits")
+    if (
+        draft_logits.shape != target_logits.shape
+        or draft_logits.device != target_logits.device
+    ):
+        raise ValueError("Joint TV and CE require matching draft and target logits")
+    return _FusedLoss.apply(
+        draft_logits, target_logits.detach(), None, _OP_TV_CE.value, True
+    )
