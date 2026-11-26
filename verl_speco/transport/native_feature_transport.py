@@ -481,16 +481,34 @@ class NativeSourceControlRouter(_NativeControlOperations):
             endpoint: NativeSourceControlClient(**options)
             for endpoint, options in routes.items()
         }
+        self._lock, self._closed = threading.Lock(), False
 
     def _call(self, method, descriptor, **arguments):
         endpoint = descriptor.get("segment") if isinstance(descriptor, dict) else None
-        if not isinstance(endpoint, str) or endpoint not in self._routes:
-            raise ValueError("Native descriptor has no configured source control route")
-        return getattr(self._routes[endpoint], method)(descriptor, **arguments)
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("Native source control router is closed")
+            if not isinstance(endpoint, str) or endpoint not in self._routes:
+                raise ValueError(
+                    "Native descriptor has no configured source control route"
+                )
+            client = self._routes[endpoint]
+        return getattr(client, method)(descriptor, **arguments)
 
     def close(self):
-        for client in self._routes.values():
-            client.close()
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            clients, self._routes = list(self._routes.values()), {}
+            failure = None
+            for client in clients:
+                try:
+                    client.close()
+                except Exception as error:
+                    failure = failure or error
+            if failure is not None:
+                raise RuntimeError("Native control client cleanup failed") from failure
 
 
 class NativeSourceDirectory:

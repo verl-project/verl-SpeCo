@@ -698,6 +698,35 @@ class StandaloneProducerActor:
             self._reference_condition.notify_all()
             self._close_drained_lease_journal()
         self._run_gate.set()
+        await self._close_native_control()
+
+    async def _close_native_control(self, *, aborted=False):
+        from verl_speco.transport.native_feature_transport import (
+            NativeSourceControlClient,
+            NativeSourceControlRouter,
+            NativeSourceDirectoryRouter,
+        )
+
+        router = self._native_transport
+        # Normal shutdown must retain channels for tail acknowledgements/releases.
+        # Directory clients are closed by freeze_and_seal after source retirement.
+        if not aborted and (
+            isinstance(router, NativeSourceDirectoryRouter)
+            or not self._reference_closed
+            or self._active_references
+            or self._execution_pending
+            or self._registered_reference_plans
+        ):
+            return
+        if isinstance(
+            router,
+            (
+                NativeSourceDirectoryRouter,
+                NativeSourceControlRouter,
+                NativeSourceControlClient,
+            ),
+        ):
+            await asyncio.to_thread(router.close)
 
     async def abort_references(self, incarnation: str | None) -> None:
         """Fence new admission without releasing any existing source references."""
@@ -712,12 +741,7 @@ class StandaloneProducerActor:
         try:
             await self._stop_native_admission()
         finally:
-            from verl_speco.transport.native_feature_transport import (
-                NativeSourceDirectoryRouter,
-            )
-
-            if isinstance(self._native_transport, NativeSourceDirectoryRouter):
-                await asyncio.to_thread(self._native_transport.close)
+            await self._close_native_control(aborted=True)
 
     async def _stop_native_admission(self) -> None:
         from verl_speco.transport.native_feature_transport import (
@@ -1186,6 +1210,7 @@ class StandaloneProducerActor:
                     next(iter(self._discarded_reference_batches))
                 ]
             self._reference_condition.notify_all()
+        await self._close_native_control()
 
     async def seal_native_sources(self, incarnation: str) -> None:
         """Stop future source publications only after all references are retired."""
@@ -1408,6 +1433,7 @@ class StandaloneProducerActor:
                 del self._released_reference_plans[oldest]
                 del self._rank_ack_counts[oldest]
             self._reference_condition.notify_all()
+        await self._close_native_control()
 
     async def _on_published(self, sequence_no: int) -> None:
         del sequence_no
@@ -1739,6 +1765,7 @@ class StandaloneProducerActor:
                 self._execution_pending.clear()
                 self._reference_condition.notify_all()
                 self._close_drained_lease_journal()
+            await self._close_native_control()
             return {"stopped": True}
 
     async def pause(self) -> dict[str, bool]:

@@ -438,7 +438,9 @@ class Source:
         options = self.connector._native_control_options
         options["response_queue"].put(
             {"channel_id": options["channel_id"], "request_id": "0" * 32, "ok": True}, timeout=5)
-    def validate_concurrent_clients(self):
+    def validate_concurrent_clients(self, teardown):
+        import asyncio
+        from queue import Queue as LocalQueue
         from concurrent.futures import ThreadPoolExecutor
         from verl_speco.transport.native_feature_transport import NativeSourceControlClient, NativeSourceControlRouter
         router = NativeSourceControlRouter({"source": self.connector._native_control_options})
@@ -446,8 +448,20 @@ class Source:
         with ThreadPoolExecutor(max_workers=2) as pool:
             list(pool.map(lambda client: client.validate_published(self.descriptor_value()), clients))
         actors = [client._private_responses.actor for client in clients]
-        router.close()
-        router.close()
+        async def shutdown(control, client):
+            producer = StandaloneProducerActor({"speco": {"standalone_tq_producer": {
+                "max_published_references": 1}}}, LocalQueue(), 1, control)
+            if teardown == "abort":
+                await producer.abort_references(producer._incarnation)
+            else:
+                await producer._on_references([{"key": "tail", "tag": {}}])
+                await producer.stop()
+                assert client._private_responses is not None, "stop closed a pending tail channel"
+                await producer.discard_unassigned_references(producer._incarnation, "tail", ["tail"])
+            assert client._private_responses is None
+            await producer.stop()
+        for control, client in zip((router, clients[1]), clients):
+            asyncio.run(shutdown(control, client))
         for client in clients:
             client.close()
             client.close()
@@ -499,7 +513,8 @@ try:
     source = Source.remote(directory_name)
     descriptor = ray.get(source.descriptor_value.remote(), timeout=20)
     ray.get(source.queue_stale_reply.remote(), timeout=10)
-    ray.get(source.validate_concurrent_clients.remote(), timeout=30)
+    for teardown in ("abort", "stop"):
+        ray.get(source.validate_concurrent_clients.remote(teardown), timeout=30)
     assert ray.get(directory.status.remote(1), timeout=10)["active_sample"][0]["handle"] == "sample"
     handle = NativeProducerReferenceStore(NativeSourceDirectoryRouter(directory, timeout=10)).resolve_reference("sample")
     assert json.loads(handle) == descriptor

@@ -28,7 +28,12 @@ representation without branching on the connector.
 
 from __future__ import annotations
 
-from verl_speco.regular_file import regular_file, regular_path, unlink_regular
+from verl_speco.regular_file import (
+    regular_file,
+    regular_file_path,
+    regular_path,
+    unlink_regular,
+)
 
 import contextlib
 import errno
@@ -232,7 +237,7 @@ def file_reference_tensor_bytes(reference: str, *, root=None, identity=None) -> 
         ):
             raise ValueError("Invalid safetensors reference header size")
         with (
-            regular_path(path, root=root, identity=identity) as pinned,
+            regular_file_path(stream, path) as pinned,
             safe_open(str(pinned), framework="pt", device="cpu") as tensors,
         ):
             if not tensors.keys():

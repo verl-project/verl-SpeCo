@@ -552,3 +552,46 @@ def test_shared_root_replacement_between_validation_and_open_is_rejected(tmp_pat
             _wait_for_lock(Path(f"{reference}.lock"), **store._file_options)
         else:
             getattr(store, operation)(str(reference))
+
+
+@pytest.mark.parametrize("change", [None, "modify", "replace"])
+def test_file_tensor_bytes_reuses_pinned_file_and_detects_changes(tmp_path, monkeypatch, change):
+    import os
+    import sys
+    from contextlib import contextmanager
+    import safetensors
+    from safetensors.torch import save_file
+    from verl_speco.producer import hidden_states_store as module
+    if change == "replace" and sys.platform != "linux":
+        pytest.skip("Linux replacement of an open file")
+    reference = tmp_path / "sample.safetensors"
+    save_file({"hidden_states": torch.arange(8, dtype=torch.float32)}, str(reference))
+    original = reference.stat()
+    opened = []
+    regular_file, safe_open = module.regular_file, safetensors.safe_open
+    @contextmanager
+    def counted_file(*args, **kwargs):
+        with regular_file(*args, **kwargs) as stream:
+            opened.append(stream.fileno())
+            yield stream
+    def inspect(pinned, **kwargs):
+        if change == "replace":
+            reference.rename(tmp_path / "original")
+            save_file({"other": torch.zeros(1)}, str(reference))
+        elif change == "modify":
+            with reference.open("r+b") as stream:
+                stream.seek(-1, 2)
+                stream.write(b"\x00")
+            os.utime(reference, ns=(original.st_atime_ns, original.st_mtime_ns + 1_000_000))
+        assert os.stat(pinned).st_ino == original.st_ino
+        return safe_open(pinned, **kwargs)
+    monkeypatch.setattr(module, "regular_file", counted_file)
+    monkeypatch.setattr(module, "regular_path", lambda *a, **k: pytest.fail("reopened file name"))
+    monkeypatch.setattr(safetensors, "safe_open", inspect)
+    store = FileHiddenStatesStore(str(tmp_path), wait_for_writer=False)
+    if change is None:
+        assert store.tensor_bytes(str(reference)) == 32
+    else:
+        with pytest.raises(ValueError, match="changed during byte accounting"):
+            store.tensor_bytes(str(reference))
+    assert len(opened) == 1

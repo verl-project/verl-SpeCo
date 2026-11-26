@@ -64,14 +64,24 @@ def regular_file(path, *, root=None, identity=None):
 @contextmanager
 def regular_path(path, *, root=None, identity=None):
     with regular_file(path, root=root, identity=identity) as stream:
-        if os.name == "posix" and Path("/proc/self/fd").is_dir():
-            yield Path(f"/proc/self/fd/{stream.fileno()}")
-        else:
-            yield Path(path)
-            current = Path(path).stat(follow_symlinks=False)
-            original = os.fstat(stream.fileno())
-            if (current.st_dev, current.st_ino) != (original.st_dev, original.st_ino):
-                raise ValueError("Regular file identity changed during reading")
+        with regular_file_path(stream, path) as pinned:
+            yield pinned
+
+
+@contextmanager
+def regular_file_path(stream, path):
+    """Expose an already validated open file to path-only readers without reopening its name."""
+    if os.name == "posix" and Path("/proc/self/fd").is_dir():
+        yield Path(f"/proc/self/fd/{stream.fileno()}")
+    else:
+        original = os.fstat(stream.fileno())
+        current = Path(path).stat(follow_symlinks=False)
+        if (current.st_dev, current.st_ino) != (original.st_dev, original.st_ino):
+            raise ValueError("Regular file identity changed before reading")
+        yield Path(path)
+        current = Path(path).stat(follow_symlinks=False)
+        if (current.st_dev, current.st_ino) != (original.st_dev, original.st_ino):
+            raise ValueError("Regular file identity changed during reading")
 
 
 def unlink_regular(path, *, root=None, identity=None):

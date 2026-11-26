@@ -463,6 +463,40 @@ def test_native_source_control_routes_and_timeout():
         mismatch.validate_published({"segment": "source"})
 
 
+@pytest.mark.parametrize("fail_first", [False, True])
+def test_native_router_close_is_serial_and_attempts_all_clients(monkeypatch, fail_first):
+    from concurrent.futures import ThreadPoolExecutor
+    from queue import Queue
+    from threading import Event
+    from verl_speco.transport.native_feature_transport import NativeSourceControlRouter
+    router = NativeSourceControlRouter({str(i): {"request_queue": Queue(), "response_queue": Queue(),
+        "channel_id": f"{i:032x}"} for i in range(2)})
+    started, proceed, closed = Event(), Event(), []
+    def close_first():
+        started.set()
+        assert proceed.wait(5)
+        closed.append(0)
+        if fail_first:
+            raise OSError("cleanup failed")
+    clients = list(router._routes.values())
+    monkeypatch.setattr(clients[0], "close", close_first)
+    monkeypatch.setattr(clients[1], "close", lambda: closed.append(1))
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(router.close)
+        assert started.wait(5)
+        second = pool.submit(router.close)
+        proceed.set()
+        if fail_first:
+            with pytest.raises(RuntimeError, match="cleanup failed"):
+                first.result(timeout=5)
+        else:
+            first.result(timeout=5)
+        second.result(timeout=5)
+    assert closed == [0, 1] and not router._routes
+    with pytest.raises(RuntimeError, match="router is closed"):
+        router.validate_published({"segment": "0"})
+
+
 def test_native_unbound_discard_never_releases_dispatched_source():
     from verl_speco.transport.native_feature_transport import NativeFeatureTransport
     source = NativeFeatureTransport(run_id="run", generation=1, endpoint="localhost:1234",
