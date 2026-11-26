@@ -152,7 +152,9 @@ def build_drafter_lr_scheduler(optimizer: Optimizer, train_cfg: Any) -> LRSchedu
         )
     if scheduler_type == "cosine":
         standalone = "_standalone_max_steps" in train_cfg
-        total_steps = int(train_cfg.get("_standalone_max_steps" if standalone else "step", 0) or 0)
+        total_steps = int(
+            train_cfg.get("_standalone_max_steps" if standalone else "step", 0) or 0
+        )
         if not 0 <= warmup_steps < total_steps:
             budget_key = "max_steps" if standalone else "step"
             raise ValueError(
