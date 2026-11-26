@@ -32,7 +32,7 @@ class _ReferenceLeaseJournal:
             raise ValueError(
                 "Reference lease journal requires an absolute regular-file path"
             )
-        path.parent.mkdir(parents=True, exist_ok=True)
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         # sqlite3 cannot adopt an existing descriptor. Restrict its directory
         # to this account before SQLite can create the DB and rollback journal.
         if os.name == "posix":
