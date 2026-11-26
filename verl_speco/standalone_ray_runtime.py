@@ -760,6 +760,14 @@ class StandaloneProducerActor:
             logger.exception(
                 "Native admission freeze was not confirmed; retain source processes and buffers"
             )
+        finally:
+            try:
+                await self._close_native_control(aborted=True)
+            except BaseException:
+                # Preserve the original transition failure for the caller.
+                logger.exception(
+                    "Native control cleanup failed after transition failure"
+                )
 
     async def _acquire_reference_slot(self, request: Any) -> None:
         sequence = request.sequence_no

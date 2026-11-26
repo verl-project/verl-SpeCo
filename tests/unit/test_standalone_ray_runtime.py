@@ -457,7 +457,20 @@ class Source:
                 await producer._on_references([{"key": "tail", "tag": {}}])
                 await producer.stop()
                 assert client._private_responses is not None, "stop closed a pending tail channel"
-                await producer.discard_unassigned_references(producer._incarnation, "tail", ["tail"])
+                if teardown == "transition":
+                    producer._native_references["tail"] = self.descriptor_value()
+                    def fail_discard(*args, **kwargs):
+                        raise RuntimeError("injected transition failure")
+                    control.discard_unbound = fail_discard
+                    try:
+                        await producer.discard_unassigned_references(producer._incarnation, "tail", ["tail"])
+                    except RuntimeError as error:
+                        assert "injected transition failure" in str(error)
+                    else:
+                        raise AssertionError("transition failure was swallowed")
+                    assert producer._reference_aborted and producer._active_references == {"tail"}
+                else:
+                    await producer.discard_unassigned_references(producer._incarnation, "tail", ["tail"])
             assert client._private_responses is None
             await producer.stop()
         for control, client in zip((router, clients[1]), clients):
@@ -513,7 +526,7 @@ try:
     source = Source.remote(directory_name)
     descriptor = ray.get(source.descriptor_value.remote(), timeout=20)
     ray.get(source.queue_stale_reply.remote(), timeout=10)
-    for teardown in ("abort", "stop"):
+    for teardown in ("abort", "stop", "transition"):
         ray.get(source.validate_concurrent_clients.remote(teardown), timeout=30)
     assert ray.get(directory.status.remote(1), timeout=10)["active_sample"][0]["handle"] == "sample"
     handle = NativeProducerReferenceStore(NativeSourceDirectoryRouter(directory, timeout=10)).resolve_reference("sample")
@@ -1238,12 +1251,19 @@ def test_native_source_seal_requires_drained_producer(monkeypatch):
     assert calls == ["sealed"]
 
 
-def test_native_source_seal_failure_aborts_reference_admission(monkeypatch):
+@pytest.mark.parametrize("cleanup_failure", [False, True])
+def test_native_source_seal_failure_aborts_reference_admission(monkeypatch, cleanup_failure):
     from verl_speco.transport.native_feature_transport import NativeSourceDirectoryRouter
     router = NativeSourceDirectoryRouter(object(), timeout=1)
     def fail():
         raise TimeoutError("seal response lost")
     monkeypatch.setattr(router, "freeze_and_seal", fail)
+    close = router.close
+    def close_control():
+        close()
+        if cleanup_failure:
+            raise OSError("cleanup failed")
+    monkeypatch.setattr(router, "close", close_control)
     actor = StandaloneProducerActor({"speco": {"standalone_tq_producer": {
         "max_published_references": 1}}}, reference_batch_size=1, native_transport=router)
     async def run():
@@ -1251,6 +1271,7 @@ def test_native_source_seal_failure_aborts_reference_admission(monkeypatch):
         with pytest.raises(TimeoutError, match="response lost"):
             await actor.seal_native_sources(actor._incarnation)
         assert actor._reference_aborted
+        assert router._closed
         with pytest.raises(RuntimeError, match="stopped, drained"):
             await actor.seal_native_sources(actor._incarnation)
     asyncio.run(run())

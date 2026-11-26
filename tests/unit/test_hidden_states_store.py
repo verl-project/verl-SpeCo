@@ -518,6 +518,27 @@ def test_regular_file_rejects_symlink_and_preserves_target(tmp_path, operation):
     assert target.read_bytes() == b"keep"
 
 
+@pytest.mark.parametrize("matching_identity", [False, True])
+def test_regular_file_requires_root_identity_even_when_path_spellings_differ(tmp_path, matching_identity):
+    from verl_speco.regular_file import regular_file
+    recorded_root, accessed_root = tmp_path / "recorded", tmp_path / "accessed"
+    recorded_root.mkdir()
+    accessed_root.mkdir()
+    reference = accessed_root / "sample"
+    reference.write_bytes(b"original")
+    # Model an alias by supplying the accessed directory's identity with a
+    # different recorded spelling. A mismatching identity must never be skipped.
+    info = (accessed_root if matching_identity else recorded_root).stat()
+    def read():
+        with regular_file(reference, root=recorded_root, identity=(info.st_dev, info.st_ino)) as stream:
+            return stream.read()
+    if matching_identity:
+        assert read() == b"original"
+    else:
+        with pytest.raises(ValueError, match="shared file root changed"):
+            read()
+
+
 @pytest.mark.parametrize("operation", ["load", "hidden_shape", "load_window", "scan_bad_auxiliary_rows", "tensor_bytes", "lock"])
 def test_shared_root_replacement_between_validation_and_open_is_rejected(tmp_path, monkeypatch, operation):
     from pathlib import Path

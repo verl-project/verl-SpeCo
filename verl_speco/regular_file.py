@@ -11,29 +11,41 @@ from pathlib import Path
 @contextmanager
 def regular_parent(path, *, root=None, identity=None):
     path = Path(os.path.abspath(path))
+    root_verified = root is None
     with ExitStack() as stack:
         if os.open in os.supports_dir_fd:
             fd = os.open(path.anchor, os.O_RDONLY | os.O_DIRECTORY)
             stack.callback(os.close, fd)
-            current = Path(path.anchor)
+            if not root_verified:
+                info = os.fstat(fd)
+                root_verified = (info.st_dev, info.st_ino) == identity
             for part in path.parent.parts[1:]:
-                current /= part
                 fd = os.open(
                     part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd
                 )
                 stack.callback(os.close, fd)
-                if root is not None and current == root:
+                if not root_verified:
                     info = os.fstat(fd)
-                    if (info.st_dev, info.st_ino) != identity:
-                        raise ValueError("Configured shared file root changed")
+                    root_verified = (info.st_dev, info.st_ino) == identity
+            # Match the actual opened ancestry, including bind-mount aliases.
+            # A spelling mismatch must never silently disable root validation.
+            if not root_verified:
+                raise ValueError(
+                    "Configured shared file root changed or is outside the file ancestry"
+                )
             yield path, fd
         else:
             if any(parent.is_symlink() for parent in (path, *path.parents)):
                 raise ValueError("Regular file paths must not contain symlinks")
-            if root is not None:
-                info = root.stat(follow_symlinks=False)
-                if (info.st_dev, info.st_ino) != identity:
-                    raise ValueError("Configured shared file root changed")
+            if not root_verified and not any(
+                (info.st_dev, info.st_ino) == identity
+                for info in (
+                    parent.stat(follow_symlinks=False) for parent in path.parents
+                )
+            ):
+                raise ValueError(
+                    "Configured shared file root changed or is outside the file ancestry"
+                )
             yield path, None
 
 
