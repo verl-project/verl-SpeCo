@@ -811,6 +811,7 @@ class DSparkTrainingModel(DFlashTrainingModel):
         target_hidden_is_raw: bool = False,
         hidden_source: Optional[str] = None,
         opd_trace: Optional[torch.Tensor] = None,
+        capture_sample_coverage: bool = False,
         next_token_ids: Optional[torch.Tensor] = None,
         next_token_loss_mask: Optional[torch.Tensor] = None,
         specopd_batch: Optional[dict] = None,
@@ -1354,6 +1355,24 @@ class DSparkTrainingModel(DFlashTrainingModel):
             diagnostics["vat/ce_loss"] = (
                 local_ploss_sum / local_ce_den.clamp_min(1e-6)
             ).detach()
+
+        if capture_sample_coverage:
+            with torch.no_grad():
+                rows = torch.arange(bsz, device=device).view(bsz, 1)
+                if document_ids is None:
+                    anchor_sample_ids = rows.expand_as(anchor_positions)
+                else:
+                    anchor_sample_ids = document_ids.gather(
+                        1, anchor_positions.clamp(max=seq_len - 1)
+                    )
+                if active_targets.numel() > 0:
+                    sample_ids = anchor_sample_ids.unsqueeze(-1).expand_as(eval_mask)
+                    active_sample_ids = sample_ids.reshape(-1)[active_mask][
+                        active_loss_weights > 0
+                    ]
+                    diagnostics["active_sample_indices"] = active_sample_ids.unique()
+                else:
+                    diagnostics["active_sample_indices"] = rows.reshape(-1)[:0]
         return (
             loss,
             accuracy,
@@ -2085,6 +2104,8 @@ class DSparkTrainerBackend(DFlashTrainerBackend):
                 "target_hidden_is_raw": True,
                 "hidden_source": batch["hidden_source"],
             }
+        if batch.get("capture_sample_coverage"):
+            target_norm_kwargs["capture_sample_coverage"] = True
         loss, accuracy, loss_pp, acc_pp, count_pp, diagnostics = model(
             input_ids=batch["input_ids"],
             hidden_states_list=hidden_states_list,
@@ -2107,6 +2128,7 @@ class DSparkTrainerBackend(DFlashTrainerBackend):
             "total_local_vloss": torch.tensor(0.0, device=batch["input_ids"].device),
             "total_local_ploss": loss * local_num_tokens,
             "local_num_tokens": local_num_tokens,
+            "active_sample_indices": diagnostics.get("active_sample_indices"),
             "v_weight": 0.0,
             "p_weight": 1.0,
             "accuracy": accuracy.detach(),

@@ -37,7 +37,7 @@ from torch.nn import SmoothL1Loss
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
 from verl.utils.device import get_device_id, get_device_name, get_torch_device
-from verl_speco.trainer.data_buffer import DataBuffer
+from verl_speco.trainer.data_buffer import DataBuffer, dspark_history_window
 from verl.utils.fsdp_utils import (
     get_fsdp_full_state_dict,
     get_fsdp_wrap_policy,
@@ -82,6 +82,10 @@ _ALIGNMENT_DEBUG_MAX_SAMPLES_ENV = "VERL_DRAFTER_ALIGNMENT_DEBUG_MAX_SAMPLES_PER
 _ALIGNMENT_DEBUG_TOKEN_WINDOW_ENV = "VERL_DRAFTER_ALIGNMENT_DEBUG_TOKEN_WINDOW"
 _ALIGNMENT_DEBUG_RANKS_ENV = "VERL_DRAFTER_ALIGNMENT_DEBUG_RANKS"
 _LAST_HIDDEN_LOGPROB_CHECK_ENV = "VERL_DRAFTER_LAST_HIDDEN_LOGPROB_CHECK"
+
+
+class DSparkHistoryVersionError(RuntimeError):
+    """A buffered sample cannot be paired with its captured teacher head."""
 
 
 def _training_sample_uid(source_item: dict[str, Any]) -> str:
@@ -696,6 +700,9 @@ class DrafterBaseTrainer:
         self.use_data_buffer = bool(
             training_cfg.get("use_data_buffer", False) or self._bubble_time_enabled
         )
+        self.dspark_history_window = dspark_history_window(
+            config.rollout.drafter, sync=not self._bubble_time_enabled
+        )
         self.current_rl_step = 0
         self.buffer_version = 0
 
@@ -804,7 +811,7 @@ class DrafterBaseTrainer:
         self._training_timing_steps = 0
         self._training_metric_sums: dict[str, float] = {}
         self._training_metric_steps = 0
-        self._current_accumulation_valid_tokens = 0
+        self._current_accumulation_valid_tokens: int | float = 0
         self._current_accumulation_vloss_sum = 0.0
         self._current_accumulation_ploss_sum = 0.0
         self._last_optimizer_valid_tokens = 0
@@ -1312,6 +1319,9 @@ class DrafterBaseTrainer:
         self._training_metric_steps = 0
         self._training_sample_draws = 0
         self._training_unique_sample_ids: set[str] = set()
+        self._dspark_history_micro_batches = 0
+        self._dspark_history_selected_samples = 0
+        self._dspark_history_prepared_samples = 0
 
     def get_training_metrics(self) -> dict[str, float]:
         sums = dict(self._training_metric_sums)
@@ -1435,6 +1445,43 @@ class DrafterBaseTrainer:
         metrics["drafter/train_unique_samples"] = float(
             len(getattr(self, "_training_unique_sample_ids", ()))
         )
+        if getattr(self, "dspark_history_window", 0):
+            metrics["drafter/dspark_history_micro_batches"] = float(
+                self._dspark_history_micro_batches
+            )
+            metrics["drafter/dspark_history_evicted_samples"] = float(
+                getattr(self, "_dspark_history_evicted", 0)
+            )
+            history_counts = {
+                "selected_samples": self._dspark_history_selected_samples,
+                "prepared_samples": self._dspark_history_prepared_samples,
+                "capacity_evictions": self.data_buffer.capacity_evictions,
+                "capacity_rejections": self.data_buffer.capacity_rejections,
+            }
+            metrics.update(
+                {
+                    f"drafter/dspark_history_{key}": float(value)
+                    for key, value in history_counts.items()
+                }
+            )
+            metrics["drafter/dspark_history_head_versions"] = float(
+                len(self._target_lm_head_snapshots)
+            )
+            metrics["drafter/dspark_history_head_cpu_bytes"] = float(
+                sum(
+                    tensor.numel() * tensor.element_size()
+                    for snapshot in self._target_lm_head_snapshots.values()
+                    for tensor in (snapshot["weight"], snapshot["row_indices"])
+                    if tensor is not None
+                )
+            )
+            head = self._target_lm_head_module()
+            if head is not None:
+                metrics["drafter/dspark_history_head_device_bytes"] = float(
+                    head.weight.numel() * head.weight.element_size()
+                    if head.weight.device.type != "cpu"
+                    else 0
+                )
         metrics["drafter/optimizer_steps_total"] = float(self.optimizer_steps_total)
         if self.optimizer is not None and self.optimizer.param_groups:
             metrics["drafter/current_lr"] = float(self.optimizer.param_groups[0]["lr"])
@@ -3366,18 +3413,24 @@ class DrafterBaseTrainer:
         # A newly received payload may replace an earlier snapshot with the
         # same logical step. Force one apply before that version can train.
         self._applied_target_lm_head_weight_step = None
-        if global_step is not None and getattr(self, "_bubble_time_enabled", False):
+        history = getattr(self, "dspark_history_window", 0)
+        bubble = getattr(self, "_bubble_time_enabled", False)
+        if global_step is not None and (history or bubble):
             version = int(global_step)
-            if protected_target_versions is not None:
-                self._protected_target_lm_head_versions = {
-                    int(item) for item in protected_target_versions
-                }
             self._target_lm_head_snapshots[version] = {
                 "weight": self._pending_target_lm_head_weight,
                 "row_indices": self._pending_target_lm_head_row_indices,
                 "source_vocab_size": self._pending_target_lm_head_source_vocab_size,
                 "chunked_apply": self._pending_target_lm_head_chunked_apply,
             }
+            if history:
+                self._prune_dspark_history_heads(keep_version=version)
+        if global_step is not None and bubble:
+            version = int(global_step)
+            if protected_target_versions is not None:
+                self._protected_target_lm_head_versions = {
+                    int(item) for item in protected_target_versions
+                }
             protected_versions = set(
                 getattr(self, "_protected_target_lm_head_versions", ())
             )
@@ -3415,6 +3468,24 @@ class DrafterBaseTrainer:
             "selected_rows": selected_rows,
             "source_vocab_size": pending_source_vocab_size,
         }
+
+    def _prune_dspark_history_heads(self, keep_version: int | None = None) -> None:
+        versions = {
+            int(item["target_version"])
+            for item in self.data_buffer.get_all_data()
+            if item.get("target_version") is not None
+        }
+        # A Sync training RPC holds references until it returns.
+        versions.update(getattr(self, "_dspark_training_versions", ()))
+        if keep_version is not None:
+            versions.add(keep_version)
+        for version in self._target_lm_head_snapshots.keys() - versions:
+            del self._target_lm_head_snapshots[version]
+        if self._target_lm_head_weight_step not in versions:
+            self._pending_target_lm_head_weight = None
+            self._pending_target_lm_head_row_indices = None
+            self._pending_target_lm_head_source_vocab_size = None
+            self._pending_target_lm_head_chunked_apply = False
 
     def select_target_lm_head_version(self, global_step: int) -> bool:
         """Stage the exact cached actor head required by buffered samples."""
@@ -5300,6 +5371,7 @@ class DrafterBaseTrainer:
         target_last_hidden_state_chunks: list[torch.Tensor],
         next_token_id_chunks: list[torch.Tensor] | None = None,
         next_token_loss_mask_chunks: list[torch.Tensor] | None = None,
+        kept_indices: list[int] | None = None,
     ) -> (
         tuple[
             torch.Tensor,
@@ -5372,6 +5444,8 @@ class DrafterBaseTrainer:
             if max_packed_len and total + real_len + pad > max_packed_len:
                 skipped += 1
                 continue
+            if kept_indices is not None:
+                kept_indices.append(idx)
             if pad:
                 ids = torch.cat([ids, torch.zeros(pad, dtype=ids.dtype, device=dev)])
                 mask = torch.cat([mask, torch.zeros(pad, dtype=mask.dtype, device=dev)])
@@ -5520,6 +5594,7 @@ class DrafterBaseTrainer:
         target_last_hidden_state_chunks: list[torch.Tensor],
         next_token_id_chunks: list[torch.Tensor] | None = None,
         next_token_loss_mask_chunks: list[torch.Tensor] | None = None,
+        kept_indices: list[int] | None = None,
     ) -> tuple[dict[str, torch.Tensor], int] | None:
         """Packing glue: pack the per-sample chunks into the training batch fields.
 
@@ -5537,6 +5612,7 @@ class DrafterBaseTrainer:
             target_last_hidden_state_chunks,
             next_token_id_chunks,
             next_token_loss_mask_chunks,
+            kept_indices=kept_indices,
         )
         if packed is None:
             return None
@@ -5567,12 +5643,60 @@ class DrafterBaseTrainer:
             fields["next_token_loss_mask"] = cast(torch.Tensor, next_token_loss_mask)
         return fields, num_packed
 
+    def _validate_dspark_target_head_revision(self, items) -> None:
+        """Reject online teacher features that do not match the applied head."""
+        if self.backend.model_type != "dspark":
+            return
+        training = self.config.rollout.drafter.training
+        if (
+            training.get("mode", "online") == "offline"
+            or bool(training.get("use_logits", False))
+            or not (
+                training.get("collect_hidden_states_from_old_logprob", False)
+                or training.get("collect_hidden_states_from_sgl", False)
+            )
+        ):
+            return
+        uses_teacher_distribution = (
+            float(
+                training.get(
+                    "dspark_l1_loss_alpha",
+                    getattr(self.model_config, "l1_loss_alpha", 0.9),
+                )
+                or 0.0
+            )
+            > 0
+            or float(training.get("dspark_lk_loss_alpha", 0.0) or 0.0) > 0
+            or float(training.get("dspark_confidence_loss_alpha", 0.0) or 0.0) > 0
+            or str(training.get("ce_target_source", "labels") or "labels").lower()
+            == "target_argmax"
+        )
+        if not uses_teacher_distribution:
+            return
+        applied_version = getattr(self, "_applied_target_lm_head_weight_step", None)
+        queued_version = getattr(self, "_target_lm_head_weight_step", None)
+        if applied_version is None:
+            raise RuntimeError(
+                "DSpark teacher distribution requires an applied target LM-head revision; "
+                f"applied=None queued={queued_version}. Queuing a head is not applying it."
+            )
+        for index, item in enumerate(items):
+            item_version = item.get("target_version")
+            if item_version is None or int(item_version) != int(applied_version):
+                raise RuntimeError(
+                    "DSpark teacher hidden/head revision mismatch: "
+                    f"item_index={index} target_version={item_version} "
+                    f"applied_head_version={applied_version} queued_head_version={queued_version}. "
+                    "Refusing to reconstruct teacher logits with a different head revision."
+                )
+
     def _prepare_training_batch(
         self,
         buffer_steps: int = 2,
         *,
         min_sample_step: Optional[int] = None,
         max_sample_step: Optional[int] = None,
+        selected_items: list[dict[str, Any]] | None = None,
     ) -> Optional[dict[str, torch.Tensor]]:
         """Prepare a batch for training using Ulysses SP to remove padding.
 
@@ -5608,7 +5732,9 @@ class DrafterBaseTrainer:
 
         # A Bubble Time plan owns an exact, version-homogeneous reservation.
         reservation_id = getattr(self, "_active_training_reservation_id", None)
-        if reservation_id is not None:
+        if selected_items is not None:
+            items = selected_items
+        elif reservation_id is not None:
             available_data = self.data_buffer.get_available_data(
                 target_version=self._active_training_target_version,
                 reservation_id=reservation_id,
@@ -5706,6 +5832,7 @@ class DrafterBaseTrainer:
             )
             return None
 
+        self._validate_dspark_target_head_revision(items)
         self._last_prepared_training_items = list(items)
 
         dev = next(self.model.parameters()).device
@@ -6271,6 +6398,7 @@ class DrafterBaseTrainer:
         label_mask = None
         document_ids = None
         if packing_enabled:
+            kept_indices: list[int] = []
             if trailing_label_rows:
                 # Extend each document by its trailing label rows so they stay
                 # inside the document (same document id). The packed input ids
@@ -6300,6 +6428,7 @@ class DrafterBaseTrainer:
                 target_last_hidden_state_chunks,
                 next_token_id_chunks,
                 next_token_loss_mask_chunks,
+                kept_indices=kept_indices,
             )
             if packed is None:
                 return None
@@ -6314,6 +6443,7 @@ class DrafterBaseTrainer:
             next_token_ids = packed_fields.get("next_token_ids")
             next_token_loss_mask = packed_fields.get("next_token_loss_mask")
             items_used = num_packed
+            used_sample_ids = [used_sample_ids[index] for index in kept_indices]
         elif self._is_block_drafter_backend():
             max_train_len = max(chunk.size(0) for chunk in input_id_chunks)
             hidden_dim = hidden_state_chunks[0].size(-1)
@@ -7486,6 +7616,10 @@ class DrafterBaseTrainer:
         self.last_training_error = None
         try:
             with torch.enable_grad():
+                if getattr(self, "dspark_history_window", 0):
+                    return await self._train_dspark_history_step(
+                        step, min_sample_step, max_sample_step
+                    )
                 return await self._training_step_impl(
                     step,
                     min_sample_step=min_sample_step,
@@ -7499,6 +7633,125 @@ class DrafterBaseTrainer:
             }
             logger.exception(f"Training step {step} failed with error: {e}")
             return False
+
+    def _dspark_history_collective(self, value: int, op) -> int:
+        if not dist.is_initialized() or self._full_training_world_size() <= 1:
+            return value
+        status = torch.tensor(value, device=self.runtime_device, dtype=torch.int32)
+        dist.all_reduce(status, op=op, group=self._full_training_group())
+        return int(status.item())
+
+    def _require_dspark_history_ready(self, error, phase: str) -> None:
+        if error is not None:
+            logger.error(
+                "[DSpark history] phase=%s rank=%s failed before readiness reduction",
+                phase,
+                self.rank,
+                exc_info=(type(error), error, error.__traceback__),
+            )
+        failed = self._dspark_history_collective(
+            int(error is not None), dist.ReduceOp.MAX
+        )
+        if failed:
+            if error is not None:
+                raise error
+            raise RuntimeError(f"DSpark history {phase} failed on another rank")
+
+    async def _train_dspark_history_step(
+        self, step: int, min_sample_step: int | None, max_sample_step: int | None
+    ) -> bool:
+        min_step = max(step - self.dspark_history_window, min_sample_step or 0)
+        candidates = self._filter_training_data_by_step(
+            self.data_buffer.get_available_data(),
+            current_step=step,
+            min_sample_step=min_step,
+            max_sample_step=step if max_sample_step is None else max_sample_step,
+        )
+        if not self._dspark_history_collective(
+            int(bool(candidates)), dist.ReduceOp.MIN
+        ):
+            return False
+
+        groups: dict[int, list[dict[str, Any]]] = {}
+        error = None
+        try:
+            selected = self._sample_training_items(
+                candidates,
+                self.batch_size,
+                random.Random((step << 16) + int(self.training_steps)),
+            )
+            self._dspark_history_selected_samples += len(selected)
+            for item in selected:
+                version = item.get("target_version")
+                if version is None or version not in self._target_lm_head_snapshots:
+                    raise DSparkHistoryVersionError(
+                        f"DSpark history missing teacher head version {version}"
+                    )
+                groups.setdefault(version, []).append(item)
+        except Exception as exc:
+            error = exc
+        self._require_dspark_history_ready(error, "teacher preflight")
+        ordered_groups = sorted(groups.items())
+        micro_batches = self._dspark_history_collective(
+            len(ordered_groups), dist.ReduceOp.MAX
+        )
+        self._dspark_training_versions = set(groups)
+        sample_ids: list[str] = []
+        self.optimizer.zero_grad(set_to_none=True)
+        try:
+            for index in range(micro_batches):
+                padding = index >= len(ordered_groups)
+                version, items = ordered_groups[0 if padding else index]
+                batch = None
+                error = None
+                try:
+                    started = time.perf_counter()
+                    self.select_target_lm_head_version(version)
+                    self._apply_pending_target_lm_head_weight()
+                    if self._applied_target_lm_head_weight_step != version:
+                        raise DSparkHistoryVersionError(
+                            f"DSpark history cannot apply teacher head version {version}"
+                        )
+                    self.record_training_timing(
+                        "timing_s/drafter_history_head_switch",
+                        time.perf_counter() - started,
+                    )
+                    started = time.perf_counter()
+                    batch = self._prepare_training_batch(
+                        selected_items=items[:1] if padding else items
+                    )
+                    if batch is None:
+                        raise ValueError(
+                            f"DSpark history preprocessing produced no batch for version {version}"
+                        )
+                    self.record_training_timing(
+                        "timing_s/drafter_prepare_batch", time.perf_counter() - started
+                    )
+                except Exception as exc:
+                    error = exc
+                self._require_dspark_history_ready(error, "batch preparation")
+                assert batch is not None
+                if not padding:
+                    self._dspark_history_prepared_samples += int(
+                        batch.get("_speco_sample_count", 0)
+                    )
+                if not await self._training_step_on_batch(
+                    batch,
+                    step,
+                    accumulation_steps=micro_batches,
+                    accumulation_index=index,
+                    history_sample_ids=sample_ids,
+                    padding_batch=padding,
+                ):
+                    return False
+                del batch
+            self._dspark_history_micro_batches += len(ordered_groups)
+            return True
+        finally:
+            self.optimizer.zero_grad(set_to_none=True)
+            self._last_prepared_training_items = []
+            self._dspark_training_versions.clear()
+            self._prune_dspark_history_heads()
 
     async def training_accumulation_step(
         self,
@@ -7713,7 +7966,10 @@ class DrafterBaseTrainer:
         *,
         accumulation_steps: int = 1,
         accumulation_index: int = 0,
+        history_sample_ids: list[str] | None = None,
+        padding_batch: bool = False,
     ) -> bool:
+        history = history_sample_ids is not None
         self.model.train()
         accumulation_steps = max(int(accumulation_steps), 1)
         accumulation_index = max(int(accumulation_index), 0)
@@ -7728,27 +7984,48 @@ class DrafterBaseTrainer:
         from verl_speco.trainer.performance_diagnostics import training_stage_clock
 
         forward_ts = training_stage_clock(self)
-        with self._ulysses_group_context():
-            with torch.amp.autocast(device_type=device_name, dtype=torch.bfloat16):
-                pad_size = int(
-                    batch.get("_speco_pad_size", getattr(self, "_current_pad_size", 0))
-                    or 0
-                )
-                loss_batch = {
-                    key: value
-                    for key, value in batch.items()
-                    if not key.startswith("_speco_")
-                }
-                loss_dict = self.backend.compute_loss(self.model, loss_batch, pad_size)
-
-                l_v = loss_dict["total_local_vloss"]
-                l_p = loss_dict["total_local_ploss"]
-                l_n = loss_dict["local_num_tokens"]
-                step_accuracy: dict[str, Any] = {}
-                if not getattr(self, "combine_standalone_metrics", False):
-                    step_accuracy = (
-                        self._record_dflash_training_metrics(loss_dict) or {}
+        loss_dict = None
+        error = None
+        try:
+            with self._ulysses_group_context():
+                with torch.amp.autocast(device_type=device_name, dtype=torch.bfloat16):
+                    pad_size = int(
+                        batch.get(
+                            "_speco_pad_size", getattr(self, "_current_pad_size", 0)
+                        )
+                        or 0
                     )
+                    loss_batch = {
+                        key: value
+                        for key, value in batch.items()
+                        if not key.startswith("_speco_")
+                    }
+                    if history and not padding_batch:
+                        loss_batch["capture_sample_coverage"] = True
+                    loss_dict = self.backend.compute_loss(
+                        self.model, loss_batch, pad_size
+                    )
+        except Exception as exc:
+            if not history:
+                raise
+            error = exc
+        if history:
+            self._require_dspark_history_ready(error, "forward")
+        assert loss_dict is not None
+        l_v = loss_dict["total_local_vloss"]
+        l_p = loss_dict["total_local_ploss"]
+        l_n = loss_dict["local_num_tokens"]
+        step_accuracy: dict[str, Any] = {}
+        if padding_batch:
+            # Keep the backward graph on ranks with fewer teacher revisions.
+            l_v, l_p, l_n = l_v * 0, l_p * 0, l_n * 0
+        elif history_sample_ids is not None and float(l_n.detach().item()) > 0:
+            ids = batch.get("_speco_sample_ids", ())
+            history_sample_ids.extend(
+                ids[index] for index in loss_dict["active_sample_indices"].tolist()
+            )
+        if not history and not getattr(self, "combine_standalone_metrics", False):
+            step_accuracy = self._record_dflash_training_metrics(loss_dict) or {}
         self.record_training_timing(
             "timing_s/drafter_forward_loss", training_stage_clock(self) - forward_ts
         )
@@ -7765,7 +8042,8 @@ class DrafterBaseTrainer:
             "timing_s/drafter_reduce_loss", training_stage_clock(self) - reduce_ts
         )
 
-        if float(global_tokens.detach().float().item()) <= 0:
+        token_weight = float(global_tokens.detach().float().item())
+        if not history and token_weight <= 0:
             logger.warning(
                 f"[DrafterTrainer rank {self.rank}] Step {self.training_steps + 1}: "
                 "no finite drafter target tokens, skipping optimizer step "
@@ -7774,8 +8052,8 @@ class DrafterBaseTrainer:
                 f"local_ploss={float(l_p.detach().float().item()) if torch.is_tensor(l_p) else l_p})"
             )
             return False
-        self._current_accumulation_valid_tokens += int(
-            global_tokens.detach().float().item()
+        self._current_accumulation_valid_tokens += (
+            token_weight if history else int(token_weight)
         )
         self._current_accumulation_vloss_sum += float(
             global_vloss.detach().float().item()
@@ -7784,7 +8062,7 @@ class DrafterBaseTrainer:
             global_ploss.detach().float().item()
         )
 
-        denom = global_tokens.clamp(min=1.0)
+        denom = global_tokens.clamp(min=1e-6 if history else 1.0)
         vloss = global_vloss / denom
         ploss = global_ploss / denom
 
@@ -7798,15 +8076,22 @@ class DrafterBaseTrainer:
                 f"ploss={float(ploss.detach().float().item())}, "
                 f"tokens={float(global_tokens.detach().float().item())}"
             )
+            if history:
+                raise FloatingPointError("DSpark history loss is non-finite")
             return False
 
-        if self.backend.model_type in {
-            "eagle3",
-            "dflash",
-            "dspark",
-            "dsv4_dspark",
-            "dflash2",
-        } and getattr(self.backend, "enable_standalone_training_metrics", False):
+        if (
+            not history
+            and self.backend.model_type
+            in {
+                "eagle3",
+                "dflash",
+                "dspark",
+                "dsv4_dspark",
+                "dflash2",
+            }
+            and getattr(self.backend, "enable_standalone_training_metrics", False)
+        ):
             # Log the actual globally reduced optimization objective, including
             # the backend's CE/L1 weights and token normalization.
             loss_key = f"{self.backend.model_type}/loss"
@@ -7822,6 +8107,9 @@ class DrafterBaseTrainer:
         # micro-batch divides here; accumulated loss-sum gradients divide once
         # by the combined valid-token count immediately before optimizer.step.
         local_loss_sum = loss_dict["v_weight"] * l_v + loss_dict["p_weight"] * l_p
+        # DSpark already normalizes its component losses before producing the
+        # rank-local objective. Preserve that objective and weight it by the
+        # same CE token mass used by its ordinary single-version reduction.
         local_loss = local_loss_sum * float(reduce_world_size)
         if accumulation_steps == 1:
             local_loss = local_loss / denom
@@ -7846,8 +8134,14 @@ class DrafterBaseTrainer:
             return True
 
         optimizer_ts = training_stage_clock(self)
+        if history and self._current_accumulation_valid_tokens <= 0:
+            return False
         if accumulation_steps > 1:
-            accumulation_denom = float(max(self._current_accumulation_valid_tokens, 1))
+            accumulation_denom = float(
+                self._current_accumulation_valid_tokens
+                if history
+                else max(self._current_accumulation_valid_tokens, 1)
+            )
             for parameter in self.model.parameters():
                 if parameter.grad is not None:
                     parameter.grad.div_(accumulation_denom)
@@ -7868,12 +8162,21 @@ class DrafterBaseTrainer:
             )
         else:
             grad_norm = self._clip_training_grad_norm()
-        if not torch.isfinite(grad_norm):
+        finite_grad_norm = bool(torch.isfinite(grad_norm))
+        if history:
+            finite_grad_norm = bool(
+                self._dspark_history_collective(
+                    int(finite_grad_norm), dist.ReduceOp.MIN
+                )
+            )
+        if not finite_grad_norm:
             logger.error(
                 f"Step {self.training_steps + 1}: non-finite drafter grad norm, "
                 f"grad_norm={float(grad_norm.detach().float().item())}"
             )
             self.optimizer.zero_grad(set_to_none=True)
+            if history:
+                raise FloatingPointError("DSpark history gradient norm is non-finite")
             return False
         current_lr = float(self.optimizer.param_groups[0]["lr"])
         self.optimizer.step()
@@ -7887,12 +8190,20 @@ class DrafterBaseTrainer:
         )
 
         self.training_steps += 1
+        successful_sample_ids = batch.get("_speco_sample_ids", ())
+        if history_sample_ids is not None:
+            successful_sample_ids = history_sample_ids
+            sample_count = len(history_sample_ids)
+            total_tokens = self._current_accumulation_valid_tokens
+            ploss = self._current_accumulation_ploss_sum / total_tokens
+            vloss = self._current_accumulation_vloss_sum / total_tokens
+            loss = loss_dict["v_weight"] * vloss + loss_dict["p_weight"] * ploss
         self._training_sample_draws = (
             getattr(self, "_training_sample_draws", 0) + sample_count
         )
         if not hasattr(self, "_training_unique_sample_ids"):
             self._training_unique_sample_ids = set()
-        self._training_unique_sample_ids.update(batch.get("_speco_sample_ids", ()))
+        self._training_unique_sample_ids.update(successful_sample_ids)
         acc_per_position = ",".join(
             f"{idx}:{value:.4f}"
             for idx, value in enumerate(step_accuracy.get("acc_per_position", []))
@@ -7906,11 +8217,11 @@ class DrafterBaseTrainer:
                 self.training_steps,
                 self.optimizer_steps_total,
                 sample_count,
-                int(global_tokens.detach().item()),
+                self._last_optimizer_valid_tokens,
                 current_lr,
-                float(loss.item()),
-                float(vloss.item()),
-                float(ploss.item()),
+                float(loss),
+                float(vloss),
+                float(ploss),
                 float(step_accuracy.get("accuracy", float("nan"))),
                 float(step_accuracy.get("top1_acc", float("nan"))),
                 float(step_accuracy.get("top5_acc", float("nan"))),
@@ -7933,6 +8244,15 @@ class DrafterBaseTrainer:
                 self.collected_data.clear()
                 self._mark_buffer_changed()
         self.data_buffer.update_rl_step(self.current_rl_step)
+        history_window = getattr(self, "dspark_history_window", 0)
+        if history_window:
+            evicted = self.data_buffer.discard_before_step(
+                self.current_rl_step - history_window
+            )
+            if evicted:
+                self._mark_buffer_changed()
+            self._dspark_history_evicted = evicted
+            self._prune_dspark_history_heads()
         logger.debug(
             f"[Rank {self.rank}] DataBuffer RL step incremented to {self.data_buffer.get_current_step()}, "
             f"total samples: {len(self.data_buffer)}"

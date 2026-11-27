@@ -2212,6 +2212,7 @@ def test_normal_sync_keeps_legacy_head_prepare_and_pending_semantics():
     plan = replace(_quota_topup_plan(), reason="training_ready")
     calls, pending = [], {"global_step": 2, "refs": "head-dispatch"}
     driver._speco_set_drafter_global_step = lambda: calls.append("set-step")
+    driver._speco_dspark_history_enabled = lambda: False
     driver._speco_start_target_lm_head_weight_sync = lambda received: (
         calls.append(received) or {"prepared": 1},
         pending,

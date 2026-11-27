@@ -31,7 +31,7 @@ class TargetHead(nn.Module):
         vocab_size, hidden_size = weight.shape
         self.fc = nn.Linear(hidden_size, vocab_size, bias=False)
         with torch.no_grad():
-            self.fc.weight.copy_(weight.detach().to(dtype=self.fc.weight.dtype))
+            self.fc.weight.copy_(weight.detach())
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return self.fc(hidden_states)

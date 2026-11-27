@@ -374,6 +374,24 @@ class TrainingOutcome:
                 len(publish_leaders) == 1 and publish_leaders[0].snapshot_ready
             ),
         }
+        history_replicas = [
+            result
+            for result in normalized_results
+            if result.get("dspark_history_replica_leader")
+        ]
+        if history_replicas:
+            for name in ("sample_draws", "unique_samples"):
+                key = f"drafter/train_{name}"
+                metrics[f"{key}_global"] = sum(
+                    _as_int(result.get(key, 0)) for result in history_replicas
+                )
+            for reason in ("teacher_version_error", "batch_failed", "oom"):
+                metrics[f"drafter/dspark_history_{reason}"] = int(
+                    any(
+                        result.get("reason") == f"dspark_history_{reason}"
+                        for result in normalized_results
+                    )
+                )
         # Surface per-block drafter training scalars (e.g. dspark/confidence_*)
         # computed by SpecoWorker.get_training_metrics() instead of dropping them.
         for block_key, block_value in _forward_block_metrics(

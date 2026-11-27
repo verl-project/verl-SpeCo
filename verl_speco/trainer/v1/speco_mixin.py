@@ -23,6 +23,7 @@ import os
 from pathlib import Path
 import tempfile
 import time
+from dataclasses import replace
 from typing import Any, cast
 
 from verl_speco.trainer.bubble_lifecycle import BUBBLE_RUNTIME_FIELDS
@@ -1631,6 +1632,14 @@ class SpecoV1Mixin(V1BubbleMixin):
         if not self._speco_oldlogprob_collection_enabled():
             return super()._compute_old_log_prob(batch, metrics)
 
+        history_enabled = getattr(self, "_speco_dspark_history_enabled", None)
+        if history_enabled is not None and history_enabled():
+            # Each local PPO update can change the actor head. Collect once
+            # per global step so that its history bucket has one revision.
+            if int(getattr(self, "local_trigger_step", 0)) != 0:
+                return super()._compute_old_log_prob(batch, metrics)
+            self._speco_set_drafter_global_step()
+
         collection_started = time.perf_counter()
         # Reset only diagnostics; never reuse sums from a previous collection.
         for name in (
@@ -2160,8 +2169,12 @@ class SpecoV1Mixin(V1BubbleMixin):
         # the final actor update.
         parameter_sync_step = max(int(getattr(self, "parameter_sync_step", 1)), 1)
         local_trigger_step = int(getattr(self, "local_trigger_step", 0))
+        history_enabled = getattr(self, "_speco_dspark_history_enabled", None)
+        use_history = history_enabled is not None and history_enabled()
         if local_trigger_step == 0:
             self._speco_v1_actor_update_seconds = 0.0
+            if use_history:
+                metrics.update(self._speco_capture_dspark_history_head())
         if local_trigger_step < parameter_sync_step - 1:
             metrics["drafter/training_deferred_to_global_step_end"] = 1
             actor_started = time.perf_counter()
@@ -2182,6 +2195,8 @@ class SpecoV1Mixin(V1BubbleMixin):
         ):
             event = self._speco_on_before_actor_update()
         plan = event.training_plan
+        if use_history and plan is not None and plan.launch:
+            plan = replace(plan, required_target_version=None)
         metrics.update(event.metrics or {})
         before_elapsed = max(0.0, time.perf_counter() - before_started)
         actor_started = time.perf_counter()

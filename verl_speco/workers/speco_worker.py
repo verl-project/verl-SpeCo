@@ -2826,6 +2826,7 @@ class SpecoWorker(Worker):
             if isinstance(training_plan, dict)
             else "sync"
         )
+        dspark_history = bool(getattr(self.trainer, "dspark_history_window", 0))
         publish_leader = (
             self.is_drafter_group_leader
             if execution_strategy == "rollout_idle_worker"
@@ -3298,6 +3299,26 @@ class SpecoWorker(Worker):
                                     "message": str(step_error),
                                 }
                             )
+                        if (
+                            not step_ok
+                            and execution_strategy == "sync"
+                            and dspark_history
+                        ):
+                            history_error = training_error or (
+                                result["errors"][-1] if step_error else {}
+                            )
+                            if _is_oom_error(history_error):
+                                reason = "dspark_history_oom"
+                            elif (
+                                history_error.get("type") == "DSparkHistoryVersionError"
+                            ):
+                                reason = "dspark_history_teacher_version_error"
+                            elif history_error:
+                                reason = "dspark_history_batch_failed"
+                            else:
+                                reason = "no_trainable_batch"
+                            result["reason"] = result["stop_reason"] = reason
+                            break
                         if not step_ok and execution_strategy == "sync":
                             # Main's Sync path attempts the remaining batches and
                             # retains prior errors for the CI contract checker.
@@ -3404,6 +3425,10 @@ class SpecoWorker(Worker):
                     result["optimizer_warmup_steps"],
                 )
                 result.update(self.trainer.get_training_metrics())
+                if dspark_history:
+                    result["dspark_history_replica_leader"] = (
+                        self.is_drafter_group_leader
+                    )
                 if self.is_drafter_group_leader:
                     logger.warning(
                         "[drafter data used] rl_step=%s replica=%s "

@@ -218,6 +218,8 @@ def test_final_actor_hook_trains_and_publishes_before_returning_to_save(monkeypa
     driver._speco_pop_rollout_idle_metrics = lambda: {}
     driver._speco_poll_pending_drafter_training = lambda: (None, None)
     driver._speco_poll_target_lm_head_prefetch = lambda: {}
+    driver._speco_capture_dspark_history_head = lambda: {}
+    driver._speco_dspark_history_enabled = lambda: False
     plan = TrainingPlan(
         launch=True,
         reason="quota_forced_completion_ready",

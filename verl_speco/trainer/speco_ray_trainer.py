@@ -106,6 +106,7 @@ from verl_speco.integration.vllm_runtime import (
 )
 from verl_speco.rl_insight_bridge import trace_state as _rl_insight_trace_state
 from verl_speco.trainer.bubble_profiler import inject_bubble_metrics
+from verl_speco.trainer.data_buffer import dspark_history_window
 from verl_speco.trainer.hard_sample_selection import partition_hard_candidates
 from verl_speco.trainer.scheduler import (
     AcceptanceFeedback,
@@ -4390,9 +4391,45 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             # pending prefetch; the post-actor gate checks readiness separately.
             return {"drafter/target_lm_head_synced": 0}
         self._speco_set_drafter_global_step()
+        if self._speco_dspark_history_enabled():
+            # The collection step already exported its pre-update head.
+            return {}
         metrics, pending = self._speco_start_target_lm_head_weight_sync(training_plan)
         self._pending_target_lm_head_sync = pending
         return metrics
+
+    def _speco_dspark_history_enabled(self) -> bool:
+        return bool(
+            dspark_history_window(
+                self._speco_drafter_config() or {},
+                sync=self._speco_drafter_schedule_config().execution_strategy.value
+                == "sync",
+            )
+        )
+
+    def _speco_capture_dspark_history_head(self) -> dict[str, Any]:
+        """Snapshot the same actor revision used by this step's old-logprob forward."""
+        if (
+            self._speco_dspark_history_enabled()
+            and not getattr(self, "_speco_drafter_frozen", False)
+            and self._speco_has_collected_drafter_samples_this_step()
+            and self._speco_last_collected_step == int(self.global_steps)
+        ):
+            # Export and acknowledge the immutable head before PPO can
+            # mutate the actor, including on collection-only steps.
+            head_metrics, pending_head = self._speco_start_target_lm_head_weight_sync(
+                history_capture=True
+            )
+            if pending_head is not None:
+                head_metrics.update(
+                    self._speco_finish_target_lm_head_weight_sync(pending_head)
+                )
+            if not head_metrics.get("drafter/target_lm_head_synced"):
+                raise RuntimeError(
+                    f"DSpark history: no teacher head exported for RL step {self.global_steps}"
+                )
+            return head_metrics
+        return {}
 
     def _speco_gate_bubble_quota_topup(
         self, plan: TrainingPlan
@@ -6220,6 +6257,8 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
     def _speco_start_target_lm_head_weight_sync(
         self,
         training_plan: TrainingPlan | None = None,
+        *,
+        history_capture: bool = False,
     ) -> tuple[dict[str, Any], dict[str, Any] | None]:
         sync_started = time.perf_counter()
         training_cfg = self._speco_drafter_training_config()
@@ -6478,6 +6517,8 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 )
             return metrics, None
 
+        if history_capture:
+            payload = {**payload, "require_target_head_ack": True}
         metrics, pending = self._speco_dispatch_target_lm_head_payload(
             payload,
             sync_started=sync_started,
@@ -6994,6 +7035,8 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             "pre_dispatch_elapsed": dispatch_started - sync_started,
             "defer_device_apply": defer_device_apply,
             "target_worker_ids": target_worker_ids,
+            "require_target_head_ack": isinstance(payload, dict)
+            and bool(payload.get("require_target_head_ack", False)),
         }
         return metrics, pending
 
@@ -7047,7 +7090,9 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
 
         wait_started = time.perf_counter()
         acknowledgements = self._ray_get_if_needed(pending.get("refs"))
-        if self._speco_rollout_idle_worker_enabled():
+        if self._speco_rollout_idle_worker_enabled() or pending.get(
+            "require_target_head_ack"
+        ):
             self._speco_validate_target_lm_head_acks(
                 acknowledgements,
                 pending.get("target_version", pending.get("global_step")),
@@ -8813,6 +8858,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             collection_outcome = getattr(self, "_speco_last_collection_outcome", None)
             if isinstance(collection_outcome, CollectionOutcome):
                 metrics.update(collection_outcome.metrics())
+            metrics.update(self._speco_capture_dspark_history_head())
             if self._speco_rollout_idle_worker_enabled():
                 # Advance an already-finished previous prefetch before deciding
                 # whether the current collected version needs a new one. This
@@ -8838,6 +8884,12 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             if training_plan is None:
                 raise RuntimeError(
                     "Drafter before-actor-update event returned no training plan"
+                )
+            if training_plan.launch and self._speco_dspark_history_enabled():
+                # A collection interval can leave this step without new data.
+                # Historical groups verify their exact heads worker-side.
+                training_plan = dataclasses.replace(
+                    training_plan, required_target_version=None
                 )
             metrics.update(before_actor_event.metrics or {})
             self._speco_log_drafter_training_plan(training_plan, metrics)

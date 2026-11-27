@@ -6849,6 +6849,29 @@ class SpecoVLLMColocateWorkerExtension(_VLLMWorkerExtensionBase):
                 "lm_head.weight is unavailable on this TP rank"
             )
         if tuple(target_weight.shape) != tuple(draft_weight.shape):
+            draft_config = getattr(draft_model, "config", None)
+            draft_vocab = getattr(draft_config, "draft_vocab_size", None)
+            target_vocab = getattr(draft_model, "target_vocab_size", None)
+            draft_to_target = getattr(draft_model, "draft_id_to_target_id", None)
+            if (
+                _load_env_drafter_config().get("enable_drafter_training") is False
+                and getattr(draft_model, "has_own_lm_head", False)
+                and isinstance(draft_vocab, int)
+                and isinstance(target_vocab, int)
+                and 0 < draft_vocab < target_vocab
+                and tuple(getattr(draft_to_target, "shape", ())) == (draft_vocab,)
+                and target_weight.ndim == draft_weight.ndim == 2
+                and target_weight.shape[1] == draft_weight.shape[1]
+            ):
+                # The checkpoint's head and d2t mapping define the same subset.
+                # A target TP shard is not indexed in this draft vocabulary.
+                logger.info(
+                    "SPECO preserved the fixed DSpark checkpoint LM head "
+                    "(draft vocabulary=%d, target vocabulary=%d)",
+                    draft_vocab,
+                    target_vocab,
+                )
+                return 0
             raise RuntimeError(
                 "Cannot synchronize the DSpark rollout LM head because TP-local "
                 f"shapes differ: target={tuple(target_weight.shape)} "
