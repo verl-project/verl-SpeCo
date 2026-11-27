@@ -55,6 +55,7 @@ from verl.utils.ulysses import (
 )
 from verl_speco.trainer.checkpoint import release_checkpoint_host_memory
 from verl_speco.trainer.feature_store import DraftFeatureSample
+from verl_speco.trainer.standalone_resume import parse_bool_setting
 from verl_speco.integration.oldlogprob_layer_ids import (
     resolve_drafter_hidden_states_layout,
 )
@@ -2018,7 +2019,11 @@ class DrafterBaseTrainer:
             resume_setting = drafter_train_config.get(
                 "resume_lr_scheduler_from_checkpoint", True
             )
-        resume_enabled = bool(resume_setting)
+        resume_enabled = (
+            False
+            if resume_setting is None
+            else parse_bool_setting(resume_setting, default=False)
+        )
         spec_model_path = self.config.rollout.drafter.get("model_path")
         if resume_enabled:
             from verl_speco.trainer.checkpoint import (

@@ -41,6 +41,9 @@ _COMPRESSED_CODEC = "gzip-delta-int64-le-v1"
 _MAX_COMPRESSED_ENTRIES = 100_000_000
 _MAX_ENCODED_BYTES = 1024**3
 _CHUNK_ENTRIES = 131_072
+_HASH_FULL_LIMIT_BYTES = 64 * 1024 * 1024
+_HASH_CHUNK_BYTES = 64 * 1024
+_HASH_SAMPLE_COUNT = 6
 
 
 def producer_data_recipe(config: Mapping[str, Any]) -> dict[str, Any]:
@@ -277,21 +280,69 @@ def _read_compressed_sequences(
 def build_input_fingerprint(
     path: str | os.PathLike[str],
     *,
-    include_content_hash: bool = False,
+    include_content_hash: bool = True,
 ) -> dict[str, Any]:
     input_path = Path(path).resolve()
     if input_path.is_dir():
-        if not (input_path / "metadata.json").is_file():
-            raise ValueError(
-                f"Standalone resume input must be a file or a saved_hidden dataset: {input_path}"
-            )
+        metadata_path = input_path / "metadata.json"
+        manifest_path = input_path / "manifest.jsonl"
+        if metadata_path.is_file() and manifest_path.is_file():
+            fingerprints = {}
+            for name, file_path in (
+                ("metadata.json", metadata_path),
+                ("manifest.jsonl", manifest_path),
+            ):
+                digest = hashlib.sha256()
+                with regular_file(file_path) as stream:
+                    for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                        digest.update(chunk)
+                fingerprints[name] = digest.hexdigest()
+            shard_fingerprints: dict[str, dict[str, int]] = {}
+            try:
+                with regular_file(manifest_path) as stream:
+                    for line in stream:
+                        if not line.strip():
+                            continue
+                        entry = json.loads(line)
+                        shard_name = entry.get("path")
+                        if not shard_name:
+                            continue
+                        shard_stat = (input_path / str(shard_name)).stat()
+                        shard_fingerprints[str(shard_name)] = {
+                            "size_bytes": int(shard_stat.st_size)
+                        }
+            except (OSError, ValueError) as exc:
+                raise ValueError(
+                    f"Cannot fingerprint shard files under {input_path}: {exc}"
+                ) from exc
+            return {
+                "path": str(input_path),
+                "format": "standalone_raw_hidden",
+                "sampler_version": 1,
+                "files": fingerprints,
+                "shards": shard_fingerprints,
+            }
+        jsonl_files = sorted(input_path.glob("*.jsonl"))
+        if jsonl_files:
+            return {
+                "path": str(input_path),
+                "format": "jsonl_token_replay",
+                "files": {
+                    file_path.name: _file_content_fingerprint(file_path)
+                    for file_path in jsonl_files
+                },
+            }
+        directory_files = sorted(
+            file_path for file_path in input_path.rglob("*") if file_path.is_file()
+        )
         return {
             "path": str(input_path),
-            "format": "standalone_raw_hidden",
-            "sampler_version": 1,
+            "format": "directory",
             "files": {
-                name: _file_sha256(input_path / name)
-                for name in ("metadata.json", "manifest.jsonl")
+                file_path.relative_to(input_path).as_posix(): _file_content_fingerprint(
+                    file_path
+                )
+                for file_path in directory_files
             },
         }
     from verl_speco.producer.input_reader import detect_input_format
@@ -525,6 +576,25 @@ def _load_reference_lease_snapshot(checkpoint_dir, digest):
     return snapshot
 
 
+def parse_bool_setting(value: Any, *, default: bool) -> bool:
+    """Parse a boolean config value without ``bool("false")`` surprises."""
+
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    text = str(value).strip().lower()
+    if text in {"", "null", "none"}:
+        return default
+    if text in {"1", "true", "yes", "on"}:
+        return True
+    if text in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"Expected a boolean setting, got {value!r}")
+
+
 def save_standalone_resume(
     checkpoint_path: str | os.PathLike[str],
     consumed_sequence_nos: Iterable[int] | torch.Tensor,
@@ -537,6 +607,9 @@ def save_standalone_resume(
     expected_input_identity: Mapping[str, Any] | None = None,
     input_fingerprint_provider: Callable[[], dict[str, Any]] | None = None,
     lease_snapshot_sha256: str | None = None,
+    data_progress: dict[str, Any] | None = None,
+    loader_config: dict[str, Any] | None = None,
+    input_fingerprint: dict[str, Any] | None = None,
 ) -> None:
     if not isinstance(storage_format, str) or storage_format not in {"tensor", "gzip"}:
         raise ValueError("Standalone resume storage_format must be tensor or gzip")
@@ -549,6 +622,8 @@ def save_standalone_resume(
         fingerprint = (
             input_fingerprint_provider()
             if input_fingerprint_provider is not None
+            else input_fingerprint
+            if input_fingerprint is not None
             else build_input_fingerprint(input_path, include_content_hash=True)
         )
         if (
@@ -638,6 +713,35 @@ def save_standalone_resume(
             if producer_shuffle.get("data_recipe") is not None:
                 shuffle_metadata["data_recipe"] = producer_shuffle["data_recipe"]
             metadata["producer_shuffle"] = shuffle_metadata
+        if data_progress is not None:
+            # Deterministic file stores do not need (or maintain) a per-sample
+            # consumed set; their loader order is a pure function of
+            # ``(seed, epoch, store)``. Persist the batch cursor instead so a
+            # resumed run continues at the exact epoch/batch position.
+            epoch = int(data_progress.get("epoch", 0) or 0)
+            batch_index = int(data_progress.get("batch_index", 0) or 0)
+            if epoch < 0 or batch_index < 0:
+                raise ValueError(
+                    f"data_progress must be non-negative: {data_progress!r}"
+                )
+            progress_metadata: dict[str, Any] = {
+                "epoch": epoch,
+                "batch_index": batch_index,
+            }
+            read_errors = data_progress.get("read_errors")
+            if read_errors is not None:
+                progress_metadata["read_errors"] = int(read_errors)
+            read_errors_exact = data_progress.get("read_errors_exact")
+            if read_errors_exact is not None:
+                progress_metadata["read_errors_exact"] = bool(read_errors_exact)
+            metadata["data_progress"] = progress_metadata
+        if loader_config is not None:
+            # The cursor is a batch ordinal over the filtered key order, so every
+            # setting that changes that order (batch size, sharding, shuffle/seed,
+            # filters, ...) must match on resume.
+            metadata["data_loader"] = {
+                str(key): value for key, value in loader_config.items()
+            }
         metadata_path = checkpoint_dir / RESUME_METADATA_NAME
         metadata_temporary = (
             checkpoint_dir / f".{RESUME_METADATA_NAME}.{uuid.uuid4().hex}.incomplete"
@@ -672,7 +776,10 @@ def load_standalone_resume(
     *,
     input_path: str | os.PathLike[str] | None = None,
     input_fingerprint: Mapping[str, Any] | None = None,
+    current_fingerprint: dict[str, Any] | None = None,
 ) -> tuple[set[int], dict[str, Any] | None]:
+    if input_fingerprint is None:
+        input_fingerprint = current_fingerprint
     if not checkpoint_path:
         return set(), None
     checkpoint_dir = Path(checkpoint_path)
@@ -766,13 +873,13 @@ def load_standalone_resume(
         include_content_hash = saved_identity is not None or (
             isinstance(saved_fingerprint, dict) and "sha256" in saved_fingerprint
         )
-        current_fingerprint = (
-            build_input_fingerprint(
+        if input_fingerprint is not None:
+            current_fingerprint = dict(input_fingerprint)
+        else:
+            assert input_path is not None
+            current_fingerprint = build_input_fingerprint(
                 input_path, include_content_hash=include_content_hash
             )
-            if input_path is not None
-            else dict(input_fingerprint or {})
-        )
         validate_resume_input_fingerprint(metadata, current_fingerprint)
     return consumed, metadata
 
@@ -782,7 +889,25 @@ def validate_resume_input_fingerprint(metadata, fingerprint):
     saved = metadata.get("input_fingerprint")
     identity = metadata.get("input_content_identity")
     current = dict(fingerprint)
-    if isinstance(saved, dict) and saved.get("format") != "standalone_raw_hidden":
+    if isinstance(saved, dict) and saved.get("format") in {
+        "jsonl_token_replay",
+        "directory",
+    }:
+        if _fingerprint_identity(saved) != _fingerprint_identity(current):
+            raise ValueError(
+                "Standalone resume input file changed since the checkpoint was saved"
+            )
+        return
+    if (
+        isinstance(saved, dict)
+        and saved.get("format") == "standalone_raw_hidden"
+        and "shards" in saved
+    ):
+        if saved["shards"] != current.get("shards"):
+            raise ValueError(
+                "Standalone resume input file changed since the checkpoint was saved"
+            )
+    if isinstance(saved, dict) and saved.get("format") is None:
         saved_parser = saved.get("parser_format")
         current_parser = current.get("parser_format")
 
@@ -837,5 +962,56 @@ __all__ = [
     "RESUME_METADATA_NAME",
     "build_input_fingerprint",
     "load_standalone_resume",
+    "parse_bool_setting",
     "save_standalone_resume",
+    "validate_standalone_loader_config",
 ]
+
+
+def _file_content_fingerprint(file_path: Path) -> dict[str, Any]:
+    size = int(file_path.stat().st_size)
+    digest = hashlib.sha256()
+    digest.update(str(size).encode())
+    with regular_file(file_path) as stream:
+        if size <= _HASH_FULL_LIMIT_BYTES:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(chunk)
+        else:
+            offsets = {0, max(size - _HASH_CHUNK_BYTES, 0)}
+            for index in range(1, _HASH_SAMPLE_COUNT):
+                offsets.add((size * index) // _HASH_SAMPLE_COUNT)
+            for offset in sorted(offsets):
+                stream.seek(offset)
+                digest.update(stream.read(_HASH_CHUNK_BYTES))
+    return {"size_bytes": size, "sha256": digest.hexdigest()}
+
+
+def _fingerprint_identity(fingerprint: dict[str, Any]) -> dict[str, Any]:
+    """Fields that must match on resume; the mount path is informational only."""
+
+    return {key: value for key, value in fingerprint.items() if key != "path"}
+
+
+def validate_standalone_loader_config(
+    saved: dict[str, Any] | None, current: dict[str, Any]
+) -> None:
+    """Fail closed when the saved cursor no longer describes this loader.
+
+    ``data_progress`` is a batch ordinal over the filtered key order. Batch
+    size, sharding, shuffle/seed, step windows and read-side filters all change
+    that order, so resuming with different settings would silently repeat or
+    skip samples instead of continuing at the saved position.
+    """
+
+    if saved is None:
+        return
+    mismatched = {
+        key: {"saved": saved.get(key), "current": current.get(key)}
+        for key in sorted(set(saved) | set(current))
+        if saved.get(key) != current.get(key)
+    }
+    if mismatched:
+        raise ValueError(
+            "Standalone resume loader configuration changed since the checkpoint "
+            f"was saved: {mismatched}"
+        )

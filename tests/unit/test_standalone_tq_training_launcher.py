@@ -1495,3 +1495,108 @@ def test_model_cache_rejects_source_change_during_verification(tmp_path, monkeyp
     monkeypatch.setattr(Path, "open", mutate_before_cache_read)
     with pytest.raises(ValueError, match="changed during cache verification"):
         _verify_local_model_cache(str(source), str(cache))
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+from verl_speco.trainer.standalone_resume import save_standalone_resume
+
+
+from verl_speco.standalone_tq_training_launcher import _standalone_resume_enabled_from_args
+
+
+
+
+def test_resume_setting_from_args_matches_trainer() -> None:
+    trainer_key = (
+        "actor_rollout_ref.rollout.drafter.training."
+        "resume_trainer_state_from_checkpoint"
+    )
+    scheduler_key = (
+        "actor_rollout_ref.rollout.drafter.training."
+        "resume_lr_scheduler_from_checkpoint"
+    )
+    assert _standalone_resume_enabled_from_args([]) is True
+    assert _standalone_resume_enabled_from_args([f"{scheduler_key}=false"]) is False
+    assert _standalone_resume_enabled_from_args([f"{trainer_key}=false"]) is False
+    assert (
+        _standalone_resume_enabled_from_args(
+            [f"{trainer_key}=true", f"{scheduler_key}=false"]
+        )
+        is True
+    )
+
+
+def test_producer_resume_path_follows_resume_setting(tmp_path) -> None:
+    (tmp_path / "config.json").write_text(
+        json.dumps({"num_hidden_layers": 36}), encoding="utf-8"
+    )
+    drafter = tmp_path / "drafter"
+    drafter.mkdir()
+    input_path = tmp_path / "train.jsonl"
+    input_path.write_text('{"prompt": "q"}\n', encoding="utf-8")
+    save_standalone_resume(
+        drafter,
+        [],
+        optimizer_step=1,
+        input_path=input_path,
+    )
+    args = [
+        f"data.train_files={input_path}",
+        f"actor_rollout_ref.model.path={tmp_path}",
+        f"actor_rollout_ref.rollout.drafter.model_path={drafter}",
+        "actor_rollout_ref.rollout.drafter.speculative_algorithm=DSPARK",
+        "actor_rollout_ref.rollout.drafter.training.max_steps=10",
+    ]
+    enabled = build_pipeline_commands(
+        resolve_pipeline_config(args, environ={}),
+        args,
+        ray_address="127.0.0.1:6379",
+        python_executable="python",
+        env={},
+    )
+    assert (
+        f"speco.standalone_tq_producer.resume_checkpoint_path={drafter}"
+        in enabled.producer_overrides
+    )
+    resume_key = (
+        "actor_rollout_ref.rollout.drafter.training."
+        "resume_trainer_state_from_checkpoint"
+    )
+    assert [
+        item
+        for item in enabled.consumer_overrides
+        if item.startswith(f"{resume_key}=")
+    ] == [f"{resume_key}=true"]
+
+    disabled_args = [
+        *args,
+        "actor_rollout_ref.rollout.drafter.training."
+        "resume_trainer_state_from_checkpoint=false",
+    ]
+    disabled = build_pipeline_commands(
+        resolve_pipeline_config(disabled_args, environ={}),
+        disabled_args,
+        ray_address="127.0.0.1:6379",
+        python_executable="python",
+        env={},
+    )
+    assert (
+        "speco.standalone_tq_producer.resume_checkpoint_path=null"
+        in disabled.producer_overrides
+    )
+    assert [
+        item
+        for item in disabled.consumer_overrides
+        if item.startswith(f"{resume_key}=")
+    ] == [f"{resume_key}=false"]

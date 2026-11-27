@@ -933,10 +933,14 @@ class SpecoV1Mixin(V1BubbleMixin):
             resume_state = training.get("resume_trainer_state_from_checkpoint")
             if resume_state is None:
                 resume_state = training.get("resume_lr_scheduler_from_checkpoint", True)
-            if (
-                not bool(resume_state)
-                and self._speco_resume_global_step_hint() is not None
-            ):
+            from verl_speco.trainer.standalone_resume import parse_bool_setting
+
+            resume_enabled = (
+                False
+                if resume_state is None
+                else parse_bool_setting(resume_state, default=False)
+            )
+            if not resume_enabled and self._speco_resume_global_step_hint() is not None:
                 raise ValueError(
                     "V1 Bubble Time requires resume_trainer_state_from_checkpoint=true "
                     "when resuming a checkpoint to restore the matching drafter weights and state"

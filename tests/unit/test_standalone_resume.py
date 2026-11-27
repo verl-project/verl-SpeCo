@@ -1480,3 +1480,264 @@ def test_resume_recipe_tracks_effective_cosine_parameters(key, value):
     with pytest.raises(ValueError, match="training plan changed"):
         _validate_resume_training_plan({"optimizer_step": 1, "training_plan": {"recipe": recipe}},
                                       1, {"recipe": _standalone_recipe({**cfg, key: value}, None)})
+
+
+
+
+
+
+from verl_speco.trainer.standalone_resume import parse_bool_setting, validate_standalone_loader_config
+
+
+def test_standalone_resume_round_trips_file_store_data_progress(tmp_path: Path) -> None:
+    input_path = tmp_path / "manifest.jsonl"
+    input_path.write_text('{"num_samples": 10}\n', encoding="utf-8")
+    checkpoint_path = tmp_path / "draft_step_4"
+
+    save_standalone_resume(
+        checkpoint_path,
+        [],
+        optimizer_step=4,
+        input_path=input_path,
+        data_progress={"epoch": 2, "batch_index": 5},
+    )
+
+    consumed, metadata = load_standalone_resume(
+        checkpoint_path, input_path=input_path
+    )
+    assert consumed == set()
+    assert metadata is not None
+    assert metadata["data_progress"] == {"epoch": 2, "batch_index": 5}
+
+    with pytest.raises(ValueError, match="data_progress must be non-negative"):
+        save_standalone_resume(
+            tmp_path / "bad",
+            [],
+            optimizer_step=1,
+            input_path=input_path,
+            data_progress={"epoch": -1, "batch_index": 0},
+        )
+
+
+def test_standalone_resume_persists_loader_config_and_read_error_state(
+    tmp_path: Path,
+) -> None:
+    input_path = tmp_path / "manifest.jsonl"
+    input_path.write_text('{"num_samples": 10}\n', encoding="utf-8")
+    checkpoint_path = tmp_path / "draft_step_6"
+    loader_config = {
+        "batch_size": 2,
+        "world_size": 2,
+        "shuffle": True,
+        "seed": 7,
+        "min_supervised_tokens": 1,
+    }
+
+    save_standalone_resume(
+        checkpoint_path,
+        [],
+        optimizer_step=6,
+        input_path=input_path,
+        data_progress={
+            "epoch": 0,
+            "batch_index": 4,
+            "read_errors": 0,
+            "read_errors_exact": True,
+        },
+        loader_config=loader_config,
+    )
+
+    _, metadata = load_standalone_resume(checkpoint_path, input_path=input_path)
+    assert metadata is not None
+    assert metadata["data_loader"] == loader_config
+    assert metadata["data_progress"] == {
+        "epoch": 0,
+        "batch_index": 4,
+        "read_errors": 0,
+        "read_errors_exact": True,
+    }
+
+
+def test_loader_config_validation_rejects_changed_settings() -> None:
+    saved = {"batch_size": 2, "world_size": 1, "seed": 0, "shuffle": True}
+    validate_standalone_loader_config(saved, dict(saved))
+    validate_standalone_loader_config(None, {"batch_size": 4})
+
+    with pytest.raises(ValueError, match="loader configuration changed"):
+        validate_standalone_loader_config(saved, {**saved, "batch_size": 4})
+
+    with pytest.raises(ValueError, match="loader configuration changed"):
+        validate_standalone_loader_config(saved, {k: v for k, v in saved.items() if k != "seed"})
+
+
+def test_build_input_fingerprint_handles_plain_jsonl_directory(tmp_path: Path) -> None:
+    data_dir = tmp_path / "jsonl"
+    data_dir.mkdir()
+    (data_dir / "a.jsonl").write_text('{"input_ids": [1, 2]}\n', encoding="utf-8")
+    (data_dir / "b.jsonl").write_text('{"input_ids": [3, 4]}\n', encoding="utf-8")
+
+    fingerprint = build_input_fingerprint(data_dir)
+    assert fingerprint["format"] == "jsonl_token_replay"
+    assert set(fingerprint["files"]) == {"a.jsonl", "b.jsonl"}
+    assert "sha256" in fingerprint["files"]["a.jsonl"]
+    assert "mtime_ns" not in fingerprint["files"]["a.jsonl"]
+
+    checkpoint_path = tmp_path / "draft_step_1"
+    save_standalone_resume(
+        checkpoint_path,
+        [],
+        optimizer_step=1,
+        input_path=data_dir,
+        data_progress={"epoch": 0, "batch_index": 1},
+        loader_config={"batch_size": 2},
+    )
+    _, metadata = load_standalone_resume(checkpoint_path, input_path=data_dir)
+    assert metadata is not None
+    assert metadata["input_fingerprint"] == fingerprint
+
+
+def test_build_input_fingerprint_handles_generic_directory(tmp_path: Path) -> None:
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    (data_dir / "shard.bin").write_bytes(b"abc")
+    (data_dir / "nested").mkdir()
+    (data_dir / "nested" / "index.json").write_text("{}", encoding="utf-8")
+
+    fingerprint = build_input_fingerprint(data_dir)
+    assert fingerprint["format"] == "directory"
+    assert set(fingerprint["files"]) == {"shard.bin", "nested/index.json"}
+    assert "sha256" in fingerprint["files"]["shard.bin"]
+
+
+def test_input_fingerprint_comparison_ignores_mount_path(tmp_path: Path) -> None:
+    dir_a = tmp_path / "a"
+    dir_b = tmp_path / "b"
+    dir_a.mkdir()
+    dir_b.mkdir()
+    (dir_a / "data.jsonl").write_text('{"input_ids": [1]}\n', encoding="utf-8")
+    (dir_b / "data.jsonl").write_text('{"input_ids": [1]}\n', encoding="utf-8")
+    checkpoint_path = tmp_path / "draft_step_1"
+
+    save_standalone_resume(
+        checkpoint_path,
+        [],
+        optimizer_step=1,
+        input_path=dir_a,
+    )
+    _, metadata = load_standalone_resume(checkpoint_path, input_path=dir_b)
+    assert metadata is not None
+
+    (dir_b / "data.jsonl").write_text('{"input_ids": [2]}\n', encoding="utf-8")
+    with pytest.raises(ValueError, match="input file changed"):
+        load_standalone_resume(checkpoint_path, input_path=dir_b)
+
+
+def test_save_standalone_resume_accepts_precomputed_fingerprint(
+    tmp_path: Path,
+) -> None:
+    input_path = tmp_path / "manifest.jsonl"
+    input_path.write_text('{"num_samples": 1}\n', encoding="utf-8")
+    checkpoint_path = tmp_path / "draft_step_1"
+    fingerprint = {"path": "/node/a", "format": "test", "files": {}}
+
+    save_standalone_resume(
+        checkpoint_path,
+        [],
+        optimizer_step=1,
+        input_path=input_path,
+        input_fingerprint=fingerprint,
+    )
+    _, metadata = load_standalone_resume(
+        checkpoint_path, current_fingerprint=fingerprint
+    )
+    assert metadata is not None
+    assert metadata["input_fingerprint"] == fingerprint
+
+    with pytest.raises(ValueError, match="input file changed"):
+        load_standalone_resume(
+            checkpoint_path,
+            current_fingerprint={**fingerprint, "format": "other"},
+        )
+
+
+def test_load_standalone_resume_accepts_precomputed_current_fingerprint(
+    monkeypatch, tmp_path: Path
+) -> None:
+    input_path = tmp_path / "manifest.jsonl"
+    input_path.write_text('{"num_samples": 1}\n', encoding="utf-8")
+    checkpoint_path = tmp_path / "draft_step_1"
+    save_standalone_resume(
+        checkpoint_path,
+        [],
+        optimizer_step=1,
+        input_path=input_path,
+    )
+    fingerprint = build_input_fingerprint(input_path)
+
+    def fail_recompute(*args, **kwargs):
+        raise AssertionError("build_input_fingerprint should not be called")
+
+    monkeypatch.setattr(
+        "verl_speco.trainer.standalone_resume.build_input_fingerprint",
+        fail_recompute,
+    )
+    _, metadata = load_standalone_resume(
+        checkpoint_path, current_fingerprint=fingerprint
+    )
+    assert metadata is not None
+
+
+def test_large_file_fingerprint_detects_head_and_tail_changes(
+    monkeypatch, tmp_path: Path
+) -> None:
+    import verl_speco.trainer.standalone_resume as resume
+
+    monkeypatch.setattr(resume, "_HASH_FULL_LIMIT_BYTES", 16)
+    monkeypatch.setattr(resume, "_HASH_CHUNK_BYTES", 4)
+    monkeypatch.setattr(resume, "_HASH_SAMPLE_COUNT", 3)
+    path = tmp_path / "big.jsonl"
+    path.write_bytes(b"0123456789abcdefghij")
+    original = build_input_fingerprint(path)
+
+    path.write_bytes(b"X123456789abcdefghij")
+    assert build_input_fingerprint(path) != original
+
+    path.write_bytes(b"0123456789abcdefghiX")
+    assert build_input_fingerprint(path) != original
+
+
+def test_build_input_fingerprint_includes_raw_hidden_shard_sizes(
+    tmp_path: Path,
+) -> None:
+    data_dir = tmp_path / "raw"
+    data_dir.mkdir()
+    metadata_path = data_dir / "metadata.json"
+    metadata_path.write_text('{"format": "torch_shard"}\n', encoding="utf-8")
+    shard_path = data_dir / "shard_000000.pt"
+    shard_path.write_bytes(b"abc")
+    (data_dir / "manifest.jsonl").write_text(
+        '{"path": "shard_000000.pt", "num_samples": 1}\n', encoding="utf-8"
+    )
+
+    fingerprint = build_input_fingerprint(data_dir)
+    assert fingerprint["format"] == "standalone_raw_hidden"
+    assert fingerprint["shards"]["shard_000000.pt"]["size_bytes"] == 3
+
+    metadata_path.write_text('{"format": "other"}\n', encoding="utf-8")
+    assert build_input_fingerprint(data_dir) != fingerprint
+
+    metadata_path.write_text('{"format": "torch_shard"}\n', encoding="utf-8")
+    shard_path.write_bytes(b"abcdef")
+    assert build_input_fingerprint(data_dir) != fingerprint
+
+
+def test_parse_bool_setting_handles_strings_and_numbers() -> None:
+    assert parse_bool_setting(True, default=False) is True
+    assert parse_bool_setting("false", default=True) is False
+    assert parse_bool_setting("true", default=False) is True
+    assert parse_bool_setting("0", default=True) is False
+    assert parse_bool_setting("on", default=False) is True
+    assert parse_bool_setting("", default=True) is True
+    assert parse_bool_setting(None, default=True) is True
+    with pytest.raises(ValueError, match="boolean setting"):
+        parse_bool_setting("nope", default=False)
