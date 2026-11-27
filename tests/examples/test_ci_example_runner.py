@@ -55,6 +55,38 @@ def test_npu_model_preparation_stages_complete_pinned_snapshots(tmp_path, missin
         prepare(staged, tmp_path / "invalid", download=download)
 
 
+@pytest.mark.parametrize("status,attempts", [(503, 3), (429, 3), (401, 1), (404, 1)])
+def test_npu_model_download_retries_only_transient_http_errors(monkeypatch, status, attempts):
+    from types import SimpleNamespace
+
+    from ci.prepare_npu_models import _download_snapshot
+
+    error = RuntimeError("download failed")
+    error.response = SimpleNamespace(status_code=status)
+    calls, delays = [], []
+    monkeypatch.setattr("ci.prepare_npu_models.time.sleep", delays.append)
+
+    def download(**options):
+        calls.append(options)
+        raise error
+
+    with pytest.raises(RuntimeError, match="download failed"):
+        _download_snapshot(download, repo_id="org/model", revision="a" * 40)
+    assert len(calls) == attempts
+    assert delays == ([15, 30] if attempts == 3 else [])
+    if attempts == 3:
+        calls.clear()
+
+        def recovered(**options):
+            calls.append(options)
+            if len(calls) == 1:
+                raise error
+            return "snapshot"
+
+        assert _download_snapshot(recovered, repo_id="org/model", revision="a" * 40) == "snapshot"
+        assert len(calls) == 2
+
+
 def _workflow(name: str) -> dict:
     path = WORKFLOWS / name
     assert path.is_file(), f"missing workflow: {name}"

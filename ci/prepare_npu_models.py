@@ -34,6 +34,23 @@ def complete(path):
     )
 
 
+def _download_snapshot(download, **options):
+    for attempt in range(3):
+        try:
+            return download(**options)
+        except Exception as exc:
+            status = getattr(getattr(exc, "response", None), "status_code", None)
+            if attempt == 2 or status not in {429, 500, 502, 503, 504}:
+                raise
+            delay = 15 * (attempt + 1)
+            print(
+                f"Model download returned HTTP {status}; retrying in {delay}s "
+                f"({attempt + 2}/3): {options['repo_id']}@{options['revision']}",
+                flush=True,
+            )
+            time.sleep(delay)
+
+
 def prepare(source, destination, *, download=None):
     source = Path(source)
     if not complete(source):
@@ -52,7 +69,8 @@ def prepare(source, destination, *, download=None):
 
             download = snapshot_download
         source = Path(
-            download(
+            _download_snapshot(
+                download,
                 repo_id=repo_id,
                 revision=snapshot[2] if snapshot else None,
                 max_workers=2,
