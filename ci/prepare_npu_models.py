@@ -2,9 +2,10 @@
 # Licensed under the Apache License, Version 2.0
 """Resolve pinned HF snapshots and stage model files before concurrent NPU loading."""
 
+from concurrent.futures import ThreadPoolExecutor
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import re
 import shutil
 import sys
@@ -51,6 +52,40 @@ def _download_snapshot(download, **options):
             time.sleep(delay)
 
 
+def _fetch_snapshot(repo_id, revision, max_workers=2, force_download=False):
+    from huggingface_hub import HfApi, hf_hub_download
+
+    # The mirror's recursive tree API can return persistent 503s. Model metadata
+    # already lists the files; pin every file request to its resolved commit.
+    info = HfApi().model_info(repo_id, revision=revision)
+    if not info.sha or (
+        re.fullmatch(r"[a-f0-9]{40}", revision or "") and info.sha != revision
+    ):
+        raise ValueError(
+            f"Model metadata did not resolve the requested revision: {repo_id}@{revision}"
+        )
+    filenames = [PurePosixPath(file.rfilename) for file in info.siblings or []]
+    if not filenames or any(
+        path.is_absolute() or ".." in path.parts or not path.parts for path in filenames
+    ):
+        raise ValueError(
+            f"Model metadata contains an invalid file list: {repo_id}@{info.sha}"
+        )
+    print(f"Downloading {len(filenames)} model files: {repo_id}@{info.sha}", flush=True)
+
+    def fetch(filename):
+        return hf_hub_download(
+            repo_id=repo_id,
+            filename=filename.as_posix(),
+            revision=info.sha,
+            force_download=force_download,
+        )
+
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        paths = list(pool.map(fetch, filenames))
+    return Path(paths[0]).parents[len(filenames[0].parts) - 1]
+
+
 def prepare(source, destination, *, download=None):
     source = Path(source)
     if not complete(source):
@@ -65,9 +100,7 @@ def prepare(source, destination, *, download=None):
                 f"Missing or incomplete local model: {source}; set the model path to a complete checkpoint"
             )
         if download is None:
-            from huggingface_hub import snapshot_download
-
-            download = snapshot_download
+            download = _fetch_snapshot
         source = Path(
             _download_snapshot(
                 download,

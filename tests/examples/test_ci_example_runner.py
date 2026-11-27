@@ -87,6 +87,38 @@ def test_npu_model_download_retries_only_transient_http_errors(monkeypatch, stat
         assert len(calls) == 2
 
 
+def test_npu_download_uses_metadata_and_pins_all_file_requests(monkeypatch, tmp_path):
+    import sys
+    from types import SimpleNamespace
+
+    from ci.prepare_npu_models import _fetch_snapshot
+
+    revision = "a" * 40
+    filenames = ["nested/tokenizer.json", "config.json", "model.safetensors"]
+    info = SimpleNamespace(sha=revision, siblings=[SimpleNamespace(rfilename=name) for name in filenames])
+    metadata_calls, file_calls = [], []
+
+    def model_info(repo_id, **options):
+        metadata_calls.append((repo_id, options))
+        return info
+
+    def download(**options):
+        file_calls.append(options)
+        return str(tmp_path / options["filename"])
+
+    monkeypatch.setitem(sys.modules, "huggingface_hub", SimpleNamespace(
+        HfApi=lambda: SimpleNamespace(model_info=model_info), hf_hub_download=download,
+    ))
+    assert _fetch_snapshot("org/model", revision) == tmp_path
+    assert metadata_calls == [("org/model", {"revision": revision})]
+    assert {call["filename"] for call in file_calls} == set(filenames)
+    assert all(call["revision"] == revision and call["repo_id"] == "org/model" for call in file_calls)
+    info.sha = "b" * 40
+    with pytest.raises(ValueError, match="requested revision"):
+        _fetch_snapshot("org/model", revision)
+    assert len(file_calls) == len(filenames)
+
+
 def _workflow(name: str) -> dict:
     path = WORKFLOWS / name
     assert path.is_file(), f"missing workflow: {name}"
