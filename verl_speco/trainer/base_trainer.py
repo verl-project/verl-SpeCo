@@ -782,6 +782,7 @@ class DrafterBaseTrainer:
         self._pending_publish_ready = False
         self.model: Any = None
         self.optimizer: Any = None
+        self.lr_schedule_plan = None
         self.lr_scheduler: Any = None
         self.drafter_train_config = None
         self._pending_target_lm_head_weight: Any = None
@@ -2024,13 +2025,36 @@ class DrafterBaseTrainer:
             restored_optimizer_lrs = [
                 float(param_group["lr"]) for param_group in self.optimizer.param_groups
             ]
+        from verl_speco.backends.lr_scheduler import (
+            resolve_standalone_lr_plan,
+            restore_drafter_scheduler,
+        )
+
+        standalone = "_standalone_max_steps" in drafter_train_config
+        scheduler_state = (restored_trainer_state or {}).get("lr_scheduler")
+        if standalone:
+            if resume_state and "lr_schedule_plan" not in resume_state and not (
+                scheduler_state and "decay_steps" in scheduler_state
+            ):
+                logger.warning(
+                    "Checkpoint has no recoverable LR plan; using current settings. "
+                    "Set the original schedule parameters to reproduce its learning rate."
+                )
+            self.lr_schedule_plan = resolve_standalone_lr_plan(
+                drafter_train_config,
+                resume_state.get("lr_schedule_plan", {}),
+                scheduler_state or {},
+            )
+            with open_dict(drafter_train_config):
+                drafter_train_config.update(self.lr_schedule_plan)
         self.lr_scheduler = self.backend.setup_scheduler(
             self.optimizer, drafter_train_config
         )
         if restored_trainer_state is not None:
-            scheduler_state = restored_trainer_state.get("lr_scheduler")
             if self.lr_scheduler is not None and isinstance(scheduler_state, dict):
-                self.lr_scheduler.load_state_dict(scheduler_state)
+                restore_drafter_scheduler(
+                    self.lr_scheduler, scheduler_state, standalone=standalone
+                )
                 restored_optimizer_lrs = [
                     float(lr) for lr in self.lr_scheduler.get_last_lr()
                 ]
@@ -2847,6 +2871,9 @@ class DrafterBaseTrainer:
                 else None
             ),
         }
+
+        if getattr(self, "lr_schedule_plan", None) is not None:
+            trainer_state["lr_schedule_plan"] = dict(self.lr_schedule_plan)
 
         def _write_full_checkpoint():
             write_started = time.perf_counter()

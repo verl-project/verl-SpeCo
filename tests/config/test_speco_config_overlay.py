@@ -106,6 +106,8 @@ def test_overlay_has_expected_default_drafter_shape() -> None:
     assert drafter.training.mode == "online"
     assert drafter.training.preserve_prompt_hidden_states is False
     assert standalone_training.preserve_prompt_hidden_states is True
+    for field in ("lr_decay_steps", "lr_warmup_steps", "min_lr_ratio"):
+        assert standalone_training[field] is None
     from verl_speco.trainer.scheduler import (
         AdaptiveScheduleConfig,
         DrafterScheduleConfig,

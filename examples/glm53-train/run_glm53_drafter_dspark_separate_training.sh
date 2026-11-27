@@ -36,7 +36,7 @@ export SAVE_FINAL_CHECKPOINT=true
 
 export LEARNING_RATE=6e-4
 export LR_WARMUP_STEPS=100
-export LR_SCHEDULER_TYPE="global_cosine"
+export LR_SCHEDULER_TYPE="cosine"
 export LR_DECAY_STEPS="${MAX_STEPS}"
 export MIN_LR_RATIO=0.1
 
