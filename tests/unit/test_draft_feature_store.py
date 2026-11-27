@@ -603,3 +603,44 @@ def test_flush_interval_n_only_flushes_matching_steps(tmp_path):
     assert list(tmp_path.glob("shard_*.pt")) == []
     assert len(store.flush_on_step(global_step=2, interval_steps=2)) == 1
     assert len(list(tmp_path.glob("shard_*.pt"))) == 1
+
+
+def test_step_window_empty_epoch_raises_for_resume_cursor(tmp_path):
+    store = TorchShardFeatureStore(tmp_path, max_samples_per_shard=8)
+    store.write_many([_sample(i) for i in range(3)])
+    store.close()
+
+    loader = DraftFeatureDataLoader(
+        TorchShardFeatureStore(tmp_path, read_only=True),
+        DraftFeatureDataLoaderConfig(
+            batch_size=2,
+            shuffle=False,
+            repeat=False,
+            min_sample_step=100,
+            max_sample_step=200,
+            start_epoch=0,
+            skip_batches=1,
+        ),
+    )
+
+    with pytest.raises(ValueError, match="exceeds the 0 batches"):
+        list(loader)
+
+
+def test_step_window_empty_epoch_finishes_without_cursor(tmp_path):
+    store = TorchShardFeatureStore(tmp_path, max_samples_per_shard=8)
+    store.write_many([_sample(i) for i in range(3)])
+    store.close()
+
+    loader = DraftFeatureDataLoader(
+        TorchShardFeatureStore(tmp_path, read_only=True),
+        DraftFeatureDataLoaderConfig(
+            batch_size=2,
+            shuffle=False,
+            repeat=False,
+            min_sample_step=100,
+            max_sample_step=200,
+        ),
+    )
+
+    assert list(loader) == []

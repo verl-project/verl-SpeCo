@@ -56,12 +56,21 @@ from verl_speco.producer.hidden_states_store import (
     require_saved_hidden_checkpoint_fingerprint,
 )
 from verl_speco.standalone_layer_ids import normalize_standalone_layer_ids
-from verl_speco.trainer.standalone_resume import load_standalone_resume
+from verl_speco.trainer.standalone_resume import (
+    load_standalone_resume,
+    parse_bool_setting,
+)
 
 logger = logging.getLogger(__name__)
 
 _MODEL_PATH_KEY = "actor_rollout_ref.model.path"
 _DRAFTER_PATH_KEY = "actor_rollout_ref.rollout.drafter.model_path"
+_RESUME_TRAINER_STATE_KEY = (
+    "actor_rollout_ref.rollout.drafter.training.resume_trainer_state_from_checkpoint"
+)
+_RESUME_LR_SCHEDULER_KEY = (
+    "actor_rollout_ref.rollout.drafter.training.resume_lr_scheduler_from_checkpoint"
+)
 _ALGORITHM_KEY = "actor_rollout_ref.rollout.drafter.speculative_algorithm"
 _TRAIN_FILES_KEY = "data.train_files"
 _TOKENIZER_PATH_KEY = (
@@ -163,6 +172,7 @@ _INTERNAL_OVERRIDE_KEYS = frozenset(
         f"{_TQ_PREFIX}.expected_feature.hidden_dtype",
         _RUNTIME_BACKEND_KEY,
         _DATA_TRANSPORT_KEY,
+        _RESUME_TRAINER_STATE_KEY,
     }
 )
 
@@ -277,6 +287,39 @@ def _strip_quotes(value: str) -> str:
     if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
         return value[1:-1]
     return value
+
+
+def _override_bool(value: str | None, *, default: bool) -> bool:
+    if value is None:
+        return default
+    return parse_bool_setting(_strip_quotes(value), default=default)
+
+
+@lru_cache(maxsize=1)
+def _default_resume_enabled() -> bool:
+    node: Any = OmegaConf.load(_PRODUCER_CONFIG_PATH)
+    training = node["actor_rollout_ref"]["rollout"]["drafter"]["training"]
+    value = training.get("resume_trainer_state_from_checkpoint", None)
+    if value is None:
+        value = training.get("resume_lr_scheduler_from_checkpoint", True)
+    return bool(value)
+
+
+def _standalone_resume_enabled_from_args(training_args: Sequence[str]) -> bool:
+    """Match the trainer's resume setting for the Producer resume sidecar.
+
+    The value comes from CLI overrides, falling back to the repo default config.
+    When using a custom base config, pass
+    ``actor_rollout_ref.rollout.drafter.training.resume_trainer_state_from_checkpoint``
+    explicitly as an override; the resolved value is forwarded to the Consumer.
+    """
+
+    raw = _find_override(training_args, _RESUME_TRAINER_STATE_KEY, normalize_key=True)
+    if raw is None or _strip_quotes(raw).strip().lower() in {"", "null", "none"}:
+        raw = _find_override(
+            training_args, _RESUME_LR_SCHEDULER_KEY, normalize_key=True
+        )
+    return _override_bool(raw, default=_default_resume_enabled())
 
 
 def _single_train_file(value: str | None) -> str:
@@ -984,10 +1027,19 @@ def build_pipeline_commands(
         }
 
     drafter_path = _strip_quotes(_find_override(training_args, _DRAFTER_PATH_KEY) or "")
-    _, resume_metadata = load_standalone_resume(
-        drafter_path or None,
-        input_path=config.input_path,
-    )
+    resume_enabled = _standalone_resume_enabled_from_args(training_args)
+    if resume_enabled:
+        _, resume_metadata = load_standalone_resume(
+            drafter_path or None,
+            input_path=config.input_path,
+        )
+    else:
+        resume_metadata = None
+        logger.info(
+            "resume_trainer_state_from_checkpoint=false; Producer will not resume "
+            "the saved consumed-sequence cursor under %s",
+            drafter_path or None,
+        )
     resumed_optimizer_step = (
         int(resume_metadata.get("optimizer_step", 0))
         if resume_metadata is not None
@@ -1126,6 +1178,9 @@ def build_pipeline_commands(
         f"{_FEATURE_STORE_PREFIX}.path=null",
         f"{_FEATURE_STORE_PREFIX}.shuffle=false",
         f"{_FEATURE_STORE_PREFIX}.repeat=false",
+        # Keep the Consumer cursor decision identical to the Producer side even
+        # when the setting came from a custom base config.
+        f"{_RESUME_TRAINER_STATE_KEY}={str(resume_enabled).lower()}",
         *tq_overrides,
     ]
     runtime_backend = _strip_quotes(
