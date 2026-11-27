@@ -30,6 +30,31 @@ WORKFLOWS = ROOT / ".github" / "workflows"
 RUNNER = ROOT / "ci" / "run_example_test.sh"
 
 
+@pytest.mark.parametrize("missing", [False, True])
+def test_npu_model_preparation_stages_complete_pinned_snapshots(tmp_path, missing):
+    from ci.prepare_npu_models import complete, prepare
+    source = tmp_path / "cached"
+    source.mkdir()
+    (source / "config.json").write_text("{}")
+    (source / "model.safetensors").write_bytes(b"weights")
+    pinned = tmp_path / "models--deepseek-ai--dspark_qwen3_8b_block7" / "snapshots" / ("a" * 40)
+    calls = []
+    def download(**kwargs):
+        calls.append(kwargs)
+        return str(source)
+    staged = prepare(pinned if missing else source, tmp_path / "staged", download=download)
+    assert complete(staged) and not (staged / "model.safetensors").is_symlink()
+    assert (staged / "model.safetensors").read_bytes() == b"weights"
+    assert bool(calls) is missing
+    if missing:
+        assert calls[0]["revision"] == "a" * 40
+        assert calls[0]["repo_id"] == "deepseek-ai/dspark_qwen3_8b_block7"
+    (staged / "model.safetensors").write_bytes(b"")
+    assert not complete(staged)
+    with pytest.raises(ValueError, match="Missing or incomplete local model"):
+        prepare(staged, tmp_path / "invalid", download=download)
+
+
 def _workflow(name: str) -> dict:
     path = WORKFLOWS / name
     assert path.is_file(), f"missing workflow: {name}"
