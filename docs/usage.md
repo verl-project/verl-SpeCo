@@ -392,6 +392,22 @@ SPECO_VLLM_ENDPOINTS='[http://127.0.0.1:8000/v1,http://127.0.0.1:8001/v1]' \
   bash examples/run_qwen3-8b_drafter_dspark_separate_training.sh
 ```
 
+For standalone drafter training, `training.max_steps` counts total optimizer
+steps, including steps completed before resume. On a fresh run,
+`training.lr_decay_steps` defaults to that budget when it is positive. With `max_steps <= 0`, training
+continues until the data source is exhausted. Set a positive `lr_decay_steps`
+to choose the decay endpoint independently (default 100 steps when there is
+no finite budget or saved plan). The `cosine` scheduler holds `min_lr_ratio`
+from this endpoint onward. Older configurations can use the aliases
+`global_cosine` and `clamped_global_cosine`. A checkpoint records the
+resolved decay endpoint, warmup steps, and minimum LR ratio in
+`metadata.json` under `trainer_state.lr_schedule_plan`. Increasing only
+`max_steps` continues the original curve. To change it, explicitly set
+`lr_decay_steps`, `lr_warmup_steps`, or `min_lr_ratio` under
+`actor_rollout_ref.rollout.drafter.training`. A changed value can cause a
+jump at the next scheduler update. For older cosine checkpoints without a
+saved plan, supply the original values to reproduce the curve.
+
 Streaming standalone training runs the Producer as a Ray actor and the Consumer
 as a Ray WorkerGroup. `speco.draft_training.data_transport=ray_reference` is the
 default: the scheduler assigns hidden-state references to Consumers. Set

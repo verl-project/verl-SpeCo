@@ -327,7 +327,7 @@ actor_rollout_ref:
         muon_adamw_name_hints: null
         lr_warmup_steps: 0
         # Supported standalone drafter scheduler types:
-        # constant, cosine, linear, global_cosine.
+        # constant, cosine, linear (global_cosine and clamped_global_cosine alias cosine).
         lr_scheduler_type: constant
         lr_decay_steps: 100
         min_lr_ratio: 0.1

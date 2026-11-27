@@ -46,6 +46,10 @@ actor_rollout_ref:
         # Explicit feature/sequence/training-window limits still apply.
         preserve_prompt_hidden_states: true
         max_steps: 1000
+        # Null inherits the checkpoint plan. Fresh runs decay over max_steps.
+        lr_decay_steps: null
+        lr_warmup_steps: null
+        min_lr_ratio: null
         save_interval_steps: 100
         save_final_checkpoint: true
         eval_interval_steps: 0
