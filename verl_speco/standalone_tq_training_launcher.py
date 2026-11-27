@@ -1105,7 +1105,13 @@ def build_pipeline_commands(
         + _hydra_list(config.vllm_aux_hidden_state_layer_ids),
         "speco.standalone_tq_producer.vllm_endpoints="
         + _hydra_list(config.vllm_endpoints),
-        f"speco.standalone_tq_producer.vllm_model={config.model_path}",
+        f"{_PRODUCER_PREFIX}.vllm_model="
+        + (
+            _find_override(
+                training_args, f"{_PRODUCER_PREFIX}.vllm_model", normalize_key=True
+            )
+            or config.model_path
+        ),
         "speco.standalone_tq_producer.max_samples="
         + str(
             _producer_max_samples(
