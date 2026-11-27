@@ -292,11 +292,7 @@ def build_input_fingerprint(
                 ("metadata.json", metadata_path),
                 ("manifest.jsonl", manifest_path),
             ):
-                digest = hashlib.sha256()
-                with regular_file(file_path) as stream:
-                    for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-                        digest.update(chunk)
-                fingerprints[name] = digest.hexdigest()
+                fingerprints[name] = _file_sha256(file_path)
             shard_fingerprints: dict[str, dict[str, int]] = {}
             try:
                 with regular_file(manifest_path) as stream:
@@ -969,6 +965,10 @@ __all__ = [
 
 
 def _file_content_fingerprint(file_path: Path) -> dict[str, Any]:
+    if file_path.is_symlink():
+        raise ValueError(
+            f"Input fingerprint requires regular files without symlinks: {file_path}. Copy with symlinks expanded"
+        )
     size = int(file_path.stat().st_size)
     digest = hashlib.sha256()
     digest.update(str(size).encode())
