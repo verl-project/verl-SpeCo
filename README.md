@@ -144,11 +144,13 @@ configuration. Check runtime compatibility and measure E2E gains for new setups.
 
 ## Community & Contributing
 
-Join the verl-SpeCo Feishu group to discuss setup and training.
+Join the verl-SpeCo Feishu or WeChat group to discuss setup and training.
 
-<p align="center">
-  <img src="docs/assets/Lark_QR_Code.png" alt="verl-SpeCo Feishu group QR code" width="220">
-</p>
+| Feishu | WeChat |
+| :---: | :---: |
+| <img src="docs/assets/Lark_QR_Code.png" alt="verl-SpeCo Feishu group QR code" width="220"> | <img src="docs/assets/WeChat_QR_Code.png" alt="verl-SpeCo WeChat group QR code" width="300"> |
+
+The WeChat invitation QR code is valid before December 4, 2026.
 
 Before contributing, follow [AGENTS.md](AGENTS.md), including duplicate-work
 checks and test reporting. See the usage guide for test commands.
