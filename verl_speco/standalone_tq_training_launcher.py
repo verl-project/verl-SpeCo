@@ -777,7 +777,13 @@ def _validate_runtime_backend_topology(
             "Standalone local Ray requires speco.draft_training.nnodes=1; "
             "multi-node training needs SPECO_EXTERNAL_RAY_ADDRESS"
         )
-    if nnodes != 1:
+    if (
+        nnodes != 1
+        or _find_override(
+            training_args, "speco.draft_training.trainer_node_ips", normalize_key=True
+        )
+        is not None
+    ):
         _trainer_node_ips(training_args, nnodes)
     shared_root = _shared_hidden_states_root(env)
     source = _strip_quotes(_find_override(training_args, _DATA_SOURCE_KEY) or "online")
@@ -858,7 +864,16 @@ def _trainer_topology_plan(
     nproc = _positive_int_override(training_args, _NPROC_KEYS, default=1)
     addresses = (
         _trainer_node_ips(training_args, nnodes)
-        if nnodes > 1 and runtime_backend == "ray"
+        if runtime_backend == "ray"
+        and (
+            nnodes > 1
+            or _find_override(
+                training_args,
+                "speco.draft_training.trainer_node_ips",
+                normalize_key=True,
+            )
+            is not None
+        )
         else None
     )
     nodes = [
@@ -1989,7 +2004,10 @@ def _format_command(command: Sequence[str]) -> str:
 
 
 def _preflight_input_file(
-    input_path: str, *, max_jsonl_line_bytes: int | None = None
+    input_path: str,
+    *,
+    max_jsonl_line_bytes: int | None = None,
+    max_json_array_bytes: int = 0,
 ) -> None:
     path = Path(input_path)
     if not path.is_file():
@@ -1998,9 +2016,13 @@ def _preflight_input_file(
 
     try:
         records = (
-            iter_input_records(path)
+            iter_input_records(path, max_json_array_bytes=max_json_array_bytes)
             if max_jsonl_line_bytes is None
-            else iter_input_records(path, max_jsonl_line_bytes=max_jsonl_line_bytes)
+            else iter_input_records(
+                path,
+                max_jsonl_line_bytes=max_jsonl_line_bytes,
+                max_json_array_bytes=max_json_array_bytes,
+            )
         )
         next(records)
     except StopIteration as exc:
@@ -2125,7 +2147,16 @@ def main(argv: Sequence[str] | None = None) -> int:
                         "ray_address": _external_ray_address(os.environ) or "local",
                         "trainer_nodes": nnodes,
                         "trainer_node_ips": _trainer_node_ips(training_args, nnodes)
-                        if nnodes > 1 and runtime_backend == "ray"
+                        if runtime_backend == "ray"
+                        and (
+                            nnodes > 1
+                            or _find_override(
+                                training_args,
+                                "speco.draft_training.trainer_node_ips",
+                                normalize_key=True,
+                            )
+                            is not None
+                        )
                         else None,
                         "processes_per_node": nproc,
                         "world_size": nnodes * nproc,
@@ -2173,12 +2204,23 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "speco.standalone_tq_producer.max_jsonl_line_bytes",
                 normalize_key=True,
             )
-            if line_limit is None:
+            array_limit = int(
+                _strip_quotes(
+                    _find_override(
+                        training_args,
+                        "speco.standalone_tq_producer.max_json_array_bytes",
+                        normalize_key=True,
+                    )
+                    or "0"
+                )
+            )
+            if line_limit is None and not array_limit:
                 _preflight_input_file(config.input_path)
             else:
                 _preflight_input_file(
                     config.input_path,
-                    max_jsonl_line_bytes=int(_strip_quotes(line_limit)),
+                    max_jsonl_line_bytes=int(_strip_quotes(line_limit or "0")),
+                    max_json_array_bytes=array_limit,
                 )
         ray_session = start_ray_session()
         try:

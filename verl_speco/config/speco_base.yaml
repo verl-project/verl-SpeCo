@@ -129,7 +129,8 @@ speco:
     # Disabled by default to preserve IDs in existing runs and checkpoints.
     stable_source_ids: false
     # Zero disables each limit; source-proportional ordering has separate bounds.
-    # JSON arrays have a separate fixed 64 MiB encoded-file limit before parsing.
+    # Optional encoded JSON-array byte limit before parsing; zero disables it.
+    max_json_array_bytes: 0
     max_jsonl_line_bytes: 0
     max_indexed_records: 10000000
     # Hash indexed rows to detect edits that preserve file metadata.

@@ -294,8 +294,11 @@ def build_input_fingerprint(
                 for name in ("metadata.json", "manifest.jsonl")
             },
         }
+    from verl_speco.producer.input_reader import detect_input_format
+
     stat = input_path.stat()
     fingerprint = {
+        "parser_format": detect_input_format(input_path),
         "path": str(input_path),
         "size_bytes": int(stat.st_size),
         "mtime_ns": int(stat.st_mtime_ns),
@@ -779,6 +782,29 @@ def validate_resume_input_fingerprint(metadata, fingerprint):
     saved = metadata.get("input_fingerprint")
     identity = metadata.get("input_content_identity")
     current = dict(fingerprint)
+    if isinstance(saved, dict) and saved.get("format") != "standalone_raw_hidden":
+        saved_parser = saved.get("parser_format")
+        current_parser = current.get("parser_format")
+
+        def legacy_kind(path):
+            suffix = Path(path or "").suffix.lower()
+            return (
+                "parquet"
+                if suffix in {".pq", ".parquet"}
+                else "json"
+                if suffix == ".json"
+                else "jsonl"
+            )
+
+        if (saved_parser is not None and saved_parser != current_parser) or (
+            saved_parser is None
+            and legacy_kind(saved.get("path")) != legacy_kind(current.get("path"))
+        ):
+            raise ValueError(
+                "Standalone resume input parser format changed; identical bytes with a different parser cannot reuse consumed occurrences"
+            )
+        if saved_parser is None:
+            current.pop("parser_format", None)
     if identity is not None:
         identity = validate_input_identity(identity)
         if input_content_identity(saved) != identity:

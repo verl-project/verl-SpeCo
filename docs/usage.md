@@ -1,6 +1,6 @@
 # verl-SpeCo Usage Guide
 
-Last updated: 11/26/2026
+Last updated: 11/27/2026
 
 Use the version and runtime guidance below to install SpeCo and run online co-training or standalone drafter training. For the project overview and architecture, see the [README](../README.md).
 
@@ -410,8 +410,9 @@ supervised response. Text such as `<tool_call>...</tool_call>` is preserved.
 The tools schema is passed to the target tokenizer's chat template and, when
 enabled, to the server-side `/render` boundary calls. Rows without `tools`
 retain the existing rendering behavior. Both sequential and shuffled reading
-support JSON arrays, including UTF-8 BOM files. Arrays have a 64 MiB encoded-file
-limit checked before parsing, including sequential reads. Parsed Python objects
+support JSON arrays, including UTF-8 BOM files. `speco.standalone_tq_producer.max_json_array_bytes` optionally bounds the encoded
+file size before parsing in both reading modes. It defaults to `0` (unlimited);
+set `67108864` for a 64 MiB limit. Parsed Python objects
 consume more memory than the encoded file. `max_indexed_records` additionally
 limits shuffled array records after parsing; `max_jsonl_line_bytes` applies only
 to JSONL. Convert larger datasets to JSONL or Parquet. `tools` requires a

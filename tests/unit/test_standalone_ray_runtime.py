@@ -1714,14 +1714,15 @@ def test_single_node_worker_group_failure_removes_placement(monkeypatch):
 
 
 @pytest.mark.parametrize("driver_device", ["npu", "cpu"])
-def test_worker_group_uses_the_pinned_placement_groups(monkeypatch, driver_device):
+@pytest.mark.parametrize("nnodes", [1, 2])
+def test_worker_group_uses_the_pinned_placement_groups(monkeypatch, driver_device, nnodes):
     from omegaconf import OmegaConf
     from verl_speco import standalone_ray_runtime as runtime
     import verl.utils.device
 
     config = OmegaConf.create({"speco": {"draft_training": {
-        "nnodes": 2, "nproc_per_node": 4,
-        "trainer_node_ips": ["10.0.0.1", "10.0.0.2"],
+        "nnodes": nnodes, "nproc_per_node": 4,
+        "trainer_node_ips": ["10.0.0.1", "10.0.0.2"][:nnodes],
         "placement_timeout_seconds": 20,
     }}})
     observed, groups = {}, [object(), object()]
@@ -1749,8 +1750,8 @@ def test_worker_group_uses_the_pinned_placement_groups(monkeypatch, driver_devic
         ],
     )
     assert runtime.build_consumer_worker_group(config, ray_module=ray) == "worker-group"
-    assert observed["pool"]["process_on_nodes"] == [4, 4]
-    assert observed["reservation"]["node_ips"] == ["10.0.0.1", "10.0.0.2"]
+    assert observed["pool"]["process_on_nodes"] == [4] * nnodes
+    assert observed["reservation"]["node_ips"] == ["10.0.0.1", "10.0.0.2"][:nnodes]
     assert observed["group"]["resource_pool"].pgs is groups
     assert observed["group"]["device_name"] == "npu"
 
@@ -3281,3 +3282,22 @@ def test_journal_rejects_replaced_and_restored_database_name(tmp_path, monkeypat
     with connect(outside) as db:
         assert db.execute("SELECT * FROM sentinel").fetchall() == [(7,)]
         assert not db.execute("SELECT 1 FROM sqlite_master WHERE name='owner'").fetchall()
+
+
+@pytest.mark.parametrize("live_ip", ["10.0.0.2", "10.0.0.3"])
+def test_single_rank_pinned_topology_checks_live_ip(monkeypatch, live_ip):
+    import ray
+    from omegaconf import OmegaConf
+    import verl_speco.trainer.draft_training_loop as loop
+    config = OmegaConf.create({"speco": {"draft_training": {
+        "nnodes": 1, "nproc_per_node": 1, "trainer_node_ips": ["10.0.0.2"]}},
+        "actor_rollout_ref": {"rollout": {"drafter": {"training": {}}}}})
+    monkeypatch.setattr(loop, "get_device_name", lambda: "npu")
+    monkeypatch.setattr(ray, "get_runtime_context", lambda: SimpleNamespace(
+        get_node_id=lambda: "node-b", get_accelerator_ids=lambda: {"NPU": ["0"]}))
+    monkeypatch.setattr(ray.util, "get_node_ip_address", lambda: live_ip)
+    if live_ip == "10.0.0.2":
+        loop._verify_live_trainer_topology(config, rank=0, world_size=1, scheduled=True)
+    else:
+        with pytest.raises(ValueError, match="differs from the plan"):
+            loop._verify_live_trainer_topology(config, rank=0, world_size=1, scheduled=True)

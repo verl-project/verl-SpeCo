@@ -1450,3 +1450,33 @@ def test_hashed_resume_without_bound_identity_accepts_relocated_input(tmp_path):
     validate_resume_input_fingerprint({"input_fingerprint": saved}, relocated)
     with pytest.raises(ValueError, match="input file changed"):
         validate_resume_input_fingerprint({"input_fingerprint": saved}, dict(relocated, sha256="0" * 64))
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+def test_resume_rejects_relocated_input_using_a_different_parser(tmp_path, legacy):
+    from verl_speco.trainer.standalone_resume import validate_resume_input_fingerprint
+    source = tmp_path / "data.json"
+    source.write_text('[\n{"sample_id":"a","prompt":"x","response":"y"},\n{"sample_id":"b","prompt":"x","response":"y"}\n]')
+    saved = build_input_fingerprint(source, include_content_hash=True)
+    if legacy:
+        saved.pop("parser_format")
+    moved = tmp_path / "moved"
+    moved.mkdir()
+    same, different = moved / "data.JSON", moved / "data.jsonl"
+    same.write_bytes(source.read_bytes())
+    different.write_bytes(source.read_bytes())
+    metadata = {"input_fingerprint": saved, "input_content_identity": input_content_identity(saved)}
+    validate_resume_input_fingerprint(metadata, build_input_fingerprint(same, include_content_hash=True))
+    with pytest.raises(ValueError, match="parser format changed"):
+        validate_resume_input_fingerprint(metadata, build_input_fingerprint(different, include_content_hash=True))
+
+
+@pytest.mark.parametrize("key,value", [("step", 200), ("num_cycles", 1.0)])
+def test_resume_recipe_tracks_effective_cosine_parameters(key, value):
+    from verl_speco.trainer.draft_training_loop import _standalone_recipe, _validate_resume_training_plan
+    cfg = {"lr_scheduler_type": "cosine", "step": 100}
+    recipe = _standalone_recipe(cfg, None)
+    assert recipe == _standalone_recipe({**cfg, "num_cycles": None}, None)
+    with pytest.raises(ValueError, match="training plan changed"):
+        _validate_resume_training_plan({"optimizer_step": 1, "training_plan": {"recipe": recipe}},
+                                      1, {"recipe": _standalone_recipe({**cfg, key: value}, None)})

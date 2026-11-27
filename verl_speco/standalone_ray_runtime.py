@@ -1657,6 +1657,9 @@ class StandaloneProducerActor:
                     await asyncio.to_thread(
                         _preflight_input_file,
                         input_path,
+                        max_json_array_bytes=_config_member(
+                            producer_cfg, "max_json_array_bytes", 0
+                        ),
                         max_jsonl_line_bytes=_config_member(
                             producer_cfg, "max_jsonl_line_bytes", 0
                         ),
@@ -1967,8 +1970,8 @@ def build_consumer_worker_group(
     )
     device_name = get_device_name()
     placement_timeout = float(draft_training.get("placement_timeout_seconds", 120))
-    if nnodes > 1:
-        node_ips = draft_training.get("trainer_node_ips")
+    node_ips = draft_training.get("trainer_node_ips")
+    if nnodes > 1 or node_ips is not None:
         if node_ips is None or len(node_ips) != nnodes:
             raise ValueError(
                 "trainer_node_ips must contain one address per trainer node"

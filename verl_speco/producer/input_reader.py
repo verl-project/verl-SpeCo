@@ -34,7 +34,7 @@ logger = logging.getLogger(__name__)
 DEFAULT_MAX_JSONL_LINE_BYTES = 0
 DEFAULT_MAX_INDEXED_RECORDS = 10_000_000
 # Arrays are materialized in memory. Large datasets must use JSONL/Parquet.
-MAX_JSON_ARRAY_BYTES = 64 * 1024**2
+DEFAULT_MAX_JSON_ARRAY_BYTES = 0
 
 
 def _bounded_jsonl_line(stream, limit: int) -> bytes:
@@ -102,6 +102,7 @@ def iter_input_records(
     max_consecutive_errors: int = 20,
     parser_strict_roles: bool = False,
     max_jsonl_line_bytes: int = DEFAULT_MAX_JSONL_LINE_BYTES,
+    max_json_array_bytes: int = DEFAULT_MAX_JSON_ARRAY_BYTES,
 ) -> Iterator[InputRecord]:
     """Yield prompt/response records from one JSONL, JSON-array or Parquet file.
 
@@ -119,6 +120,9 @@ def iter_input_records(
         raise ValueError("max_consecutive_errors must be >= 0")
     if type(max_jsonl_line_bytes) is not int or max_jsonl_line_bytes < 0:
         raise ValueError("max_jsonl_line_bytes must be a non-negative integer")
+
+    if type(max_json_array_bytes) is not int or max_json_array_bytes < 0:
+        raise ValueError("max_json_array_bytes must be a non-negative integer")
 
     input_path = Path(path)
     if not input_path.is_file():
@@ -148,7 +152,7 @@ def iter_input_records(
 
     sequence_no = 0
     for location, payload in _iter_payloads(
-        input_path, handle_error, max_jsonl_line_bytes
+        input_path, handle_error, max_jsonl_line_bytes, max_json_array_bytes
     ):
         try:
             record = _record_from_payload(
@@ -190,6 +194,7 @@ class ShuffledJsonlReader:
         source_field: str | None = None,
         stable_source_ids: bool = False,
         max_jsonl_line_bytes: int = DEFAULT_MAX_JSONL_LINE_BYTES,
+        max_json_array_bytes: int = DEFAULT_MAX_JSON_ARRAY_BYTES,
         max_indexed_records: int = DEFAULT_MAX_INDEXED_RECORDS,
         verify_indexed_input: bool = False,
     ) -> None:
@@ -210,6 +215,8 @@ class ShuffledJsonlReader:
             )
         if type(verify_indexed_input) is not bool:
             raise ValueError("verify_indexed_input must be a boolean")
+        if type(max_json_array_bytes) is not int or max_json_array_bytes < 0:
+            raise ValueError("max_json_array_bytes must be a non-negative integer")
         input_path = Path(path)
         if not input_path.is_file():
             raise FileNotFoundError(f"Producer input file not found: {input_path}")
@@ -240,7 +247,9 @@ class ShuffledJsonlReader:
         unique_sources: dict[str, str] = {}
         before = self._signature(input_path.stat())
         self._payloads = (
-            _load_json_array(input_path) if _is_json_array(input_path) else None
+            _load_json_array(input_path, max_json_array_bytes)
+            if _is_json_array(input_path)
+            else None
         )
         if self._payloads is not None:
             if max_indexed_records and len(self._payloads) > max_indexed_records:
@@ -604,15 +613,29 @@ def _iter_payloads(
     input_path: Path,
     on_error: Any = None,
     max_jsonl_line_bytes: int = DEFAULT_MAX_JSONL_LINE_BYTES,
+    max_json_array_bytes: int = DEFAULT_MAX_JSON_ARRAY_BYTES,
 ) -> Iterator[tuple[str, Any]]:
-    if _is_parquet(input_path):
+    input_format = detect_input_format(input_path)
+    if input_format == "parquet":
         yield from _iter_parquet_payloads(input_path)
         return
-    if _is_json_array(input_path):
-        for index, payload in enumerate(_load_json_array(input_path)):
+    if input_format == "json_array":
+        for index, payload in enumerate(
+            _load_json_array(input_path, max_json_array_bytes)
+        ):
             yield f"{input_path}:item {index + 1}", payload
         return
     yield from _iter_jsonl_payloads(input_path, on_error, max_jsonl_line_bytes)
+
+
+def detect_input_format(input_path: Path) -> str:
+    return (
+        "parquet"
+        if _is_parquet(input_path)
+        else "json_array"
+        if _is_json_array(input_path)
+        else "jsonl"
+    )
 
 
 def _is_json_array(input_path: Path) -> bool:
@@ -628,13 +651,19 @@ def _is_json_array(input_path: Path) -> bool:
         return token == b"["
 
 
-def _load_json_array(input_path: Path) -> list[Any]:
+def _load_json_array(
+    input_path: Path, limit: int = DEFAULT_MAX_JSON_ARRAY_BYTES
+) -> list[Any]:
     with input_path.open("rb") as input_file:
-        if os.fstat(input_file.fileno()).st_size > MAX_JSON_ARRAY_BYTES:
-            raise ValueError("JSON array exceeds 64 MiB; convert the dataset to JSONL")
-        encoded = input_file.read(MAX_JSON_ARRAY_BYTES + 1)
-        if len(encoded) > MAX_JSON_ARRAY_BYTES:
-            raise ValueError("JSON array exceeds 64 MiB; convert the dataset to JSONL")
+        if limit and os.fstat(input_file.fileno()).st_size > limit:
+            raise ValueError(
+                f"JSON array exceeds max_json_array_bytes={limit}; increase or disable the limit, or convert the dataset to JSONL"
+            )
+        encoded = input_file.read(limit + 1) if limit else input_file.read()
+        if limit and len(encoded) > limit:
+            raise ValueError(
+                f"JSON array exceeds max_json_array_bytes={limit}; increase or disable the limit, or convert the dataset to JSONL"
+            )
     payloads = json.loads(encoded.decode("utf-8-sig"))
     if not isinstance(payloads, list):
         raise ValueError(f"Producer input {input_path} must contain a JSON array")

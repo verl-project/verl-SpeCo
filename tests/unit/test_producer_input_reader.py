@@ -201,16 +201,16 @@ def test_json_array_skips_invalid_tool_rows_in_both_readers(tmp_path, suffix, en
 @pytest.mark.parametrize("shuffled", [False, True])
 def test_json_array_size_bound_precedes_decoding(tmp_path, monkeypatch, shuffled):
     path = tmp_path / "large.json"
-    # A sparse oversized array must fail before any complete read or JSON decode.
-    with path.open("wb") as stream:
-        stream.write(b"[")
-        stream.truncate(input_reader.MAX_JSON_ARRAY_BYTES + 1)
-    monkeypatch.setattr(input_reader.json, "loads", lambda *args: pytest.fail("oversized array was decoded"))
-    with pytest.raises(ValueError, match="convert the dataset to JSONL"):
+    path.write_text(json.dumps([_tool_row()]), encoding="utf-8")
+    def read(limit):
         if shuffled:
-            input_reader.ShuffledJsonlReader(path, max_indexed_records=1)
-        else:
-            list(input_reader.iter_input_records(path))
+            reader = input_reader.ShuffledJsonlReader(path, max_json_array_bytes=limit)
+            return list(reader.iter_records([0]))
+        return list(input_reader.iter_input_records(path, max_json_array_bytes=limit))
+    with pytest.raises(ValueError, match="max_json_array_bytes=8"):
+        read(8)
+    assert len(read(0)) == 1
+    assert len(read(path.stat().st_size)) == 1
 
 
 def test_json_array_record_limit_and_string_tools_are_rejected(tmp_path):

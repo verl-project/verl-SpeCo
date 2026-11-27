@@ -435,6 +435,7 @@ def validate_producer_config(config: Any, *, allow_native: bool = False) -> str:
     for name, default in (
         ("max_jsonl_line_bytes", DEFAULT_MAX_JSONL_LINE_BYTES),
         ("max_indexed_records", DEFAULT_MAX_INDEXED_RECORDS),
+        ("max_json_array_bytes", 0),
     ):
         value = producer_cfg.get(name, default)
         if type(value) is not int or value < 0:
@@ -1331,6 +1332,7 @@ async def run_producer(
                     ),
                     source_field=source_field,
                     stable_source_ids=producer_cfg.get("stable_source_ids", False),
+                    max_json_array_bytes=producer_cfg.get("max_json_array_bytes", 0),
                     max_jsonl_line_bytes=producer_cfg.get(
                         "max_jsonl_line_bytes", DEFAULT_MAX_JSONL_LINE_BYTES
                     ),
@@ -1387,6 +1389,9 @@ async def run_producer(
                 else:
                     record_iter = iter_input_records(
                         str(producer_cfg["input_path"]),
+                        max_json_array_bytes=producer_cfg.get(
+                            "max_json_array_bytes", 0
+                        ),
                         max_jsonl_line_bytes=producer_cfg.get(
                             "max_jsonl_line_bytes", DEFAULT_MAX_JSONL_LINE_BYTES
                         ),

@@ -438,6 +438,21 @@ def _standalone_recipe(
         if key in explicit
         or (str(key).startswith(prefixes) and "debug" not in str(key))
     }
+    scheduler = (
+        str(
+            training_cfg.get("warmup_style")
+            or training_cfg.get("lr_scheduler_type")
+            or "constant"
+        )
+        .strip()
+        .lower()
+    )
+    if scheduler == "cosine":
+        selected["step"] = int(training_cfg.get("step", 0) or 0)
+        cycles = training_cfg.get("num_cycles", 0.5)
+        selected["num_cycles"] = float(0.5 if cycles is None else cycles)
+    if scheduler in {"linear", "linear_decay"} and "lr_decay_steps" not in training_cfg:
+        selected["step"] = int(training_cfg.get("step", 0) or 0)
     if training_cfg.get("reference_owned_windows", False):
         selected["reference_owned_windows"] = True
     feature_store = training_cfg.get("feature_store") or {}
@@ -738,7 +753,12 @@ def _verify_live_trainer_topology(
     events_available=None,
     producer_available=None,
 ):
-    if not scheduled or world_size <= 1:
+    if not scheduled:
+        return
+    if (
+        world_size <= 1
+        and getattr(config.speco.draft_training, "trainer_node_ips", None) is None
+    ):
         return
     record = {"rank": rank}
     try:
@@ -810,7 +830,7 @@ def _verify_live_trainer_topology(
             if node_id is None or not str(node_id).strip():
                 raise ValueError("Node reference owner requires a verified Ray node ID")
             record["node_owner_node_id"] = str(node_id)
-        if nnodes > 1:
+        if nnodes > 1 or nodes is not None:
             import ray
 
             context = ray.get_runtime_context()
@@ -829,7 +849,10 @@ def _verify_live_trainer_topology(
     except Exception as exc:  # All ranks must still enter the collective.
         record["error"] = f"{type(exc).__name__}: {exc}"
     gathered = [None] * world_size
-    dist.all_gather_object(gathered, record)
+    if world_size > 1:
+        dist.all_gather_object(gathered, record)
+    else:
+        gathered[0] = record
     if any(not isinstance(item, dict) or item.get("error") for item in gathered):
         raise ValueError(f"Cannot verify live trainer placement: {gathered}")
     if {item.get("rank") for item in gathered} != set(range(world_size)):
@@ -854,7 +877,7 @@ def _verify_live_trainer_topology(
             raise ValueError(
                 "Different node reference owner groups cannot share a Ray node"
             )
-    if plan["nnodes"] > 1:
+    if plan["nnodes"] > 1 or plan["node_ips"] is not None:
         if not plan["node_ips"] or len(plan["node_ips"]) != plan["nnodes"]:
             raise ValueError("Configured trainer node count does not match its IP list")
         _validate_live_trainer_topology(
