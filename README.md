@@ -20,16 +20,6 @@ In the Qwen3-8B + DSpark evaluation, async Train+Freeze achieved **1.50× GPU**
 and **1.58× Ascend NPU** end-to-end step speedup against each platform's
 synchronous baseline without speculative decoding. [See the comparison](#co-training-results).
 
-## News
-
-- [2026/11] [v0.2.1](https://github.com/verl-project/verl-SpeCo/releases/tag/v0.2.1) released.
-  - **Draft-OPD and Verification-Aware Training (VAT)** add training objectives for DFlash and DSpark. [Draft-OPD and VAT examples](#online-co-training)
-  - **Standalone training** adds DSpark examples for GLM-5.3 and DeepSeek-V4-Flash and supports training from saved raw hidden states. [Standalone examples](#standalone-drafter-training)
-  - **Synchronous V1 Bubble Time** runs drafter optimizer steps during rollout-idle windows on verl 0.9 with vLLM. [V1 Bubble Time guide](docs/bubble_time_v1.md)
-- [2026/11] [v0.2.0](https://github.com/verl-project/verl-SpeCo/releases/tag/v0.2.0) released: V1 synchronous/asynchronous DSpark co-training, Bubble Time, acceptance-guided freezing and hard sampling, standalone training, and expanded runtime integration.
-- [2026/08] [v0.1.0](https://github.com/verl-project/verl-SpeCo/releases/tag/v0.1.0) released: end-to-end DSpark support, decoupled feature collection/training, and more drafter backends.
-- [2026/06] [v0.1.0-pre](https://github.com/verl-project/verl-SpeCo/releases/tag/v0.1.0-pre) pre-released: speculative drafter collection, training, and hot-updates on verl.
-
 ## Key Features
 
 - **Online adaptation:** reuse rollout responses and old-policy features; train from current data or replay, then safely publish drafter weights.
@@ -141,6 +131,16 @@ runtime requirements in the detailed guide.
 
 The reported speedups are for the paper's DSpark, Qwen3-8B, GRPO, and vLLM
 configuration. Check runtime compatibility and measure E2E gains for new setups.
+
+## News
+
+- [2026/11] [v0.2.1](https://github.com/verl-project/verl-SpeCo/releases/tag/v0.2.1) released.
+  - **Draft-OPD and Verification-Aware Training (VAT)** add training objectives for DFlash and DSpark. [Draft-OPD and VAT examples](#online-co-training)
+  - **Standalone training** adds DSpark examples for GLM-5.3 and DeepSeek-V4-Flash and supports training from saved raw hidden states. [Standalone examples](#standalone-drafter-training)
+  - **Synchronous V1 Bubble Time** runs drafter optimizer steps during rollout-idle windows on verl 0.9 with vLLM. [V1 Bubble Time guide](docs/bubble_time_v1.md)
+- [2026/11] [v0.2.0](https://github.com/verl-project/verl-SpeCo/releases/tag/v0.2.0) released: V1 synchronous/asynchronous DSpark co-training, Bubble Time, acceptance-guided freezing and hard sampling, standalone training, and expanded runtime integration.
+- [2026/08] [v0.1.0](https://github.com/verl-project/verl-SpeCo/releases/tag/v0.1.0) released: end-to-end DSpark support, decoupled feature collection/training, and more drafter backends.
+- [2026/06] [v0.1.0-pre](https://github.com/verl-project/verl-SpeCo/releases/tag/v0.1.0-pre) pre-released: speculative drafter collection, training, and hot-updates on verl.
 
 ## Community & Contributing
 
