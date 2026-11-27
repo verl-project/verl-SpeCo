@@ -251,9 +251,18 @@ def test_patch_skips_native_support_and_non_workers(sglang_patch, spec_workers) 
     assert dflash_cls.update_weights_from_tensor is patched
 
 
+@pytest.mark.parametrize(
+    "records_weight_version",
+    [
+        pytest.param(True, id="sglang-main-records-weight-version"),
+        # SGLang v0.5.13-v0.5.16 managers have no record_weight_version_after_update.
+        pytest.param(False, id="sglang-v0.5.16-no-weight-version-hook"),
+    ],
+)
 def test_scheduler_dispatch_patches_a_late_loaded_dspark_worker(
-    monkeypatch, sglang_patch
+    monkeypatch, sglang_patch, records_weight_version
 ) -> None:
+    recorded_versions = []
     scheduler_components = types.ModuleType("sglang.srt.managers.scheduler_components")
     weight_updater = types.ModuleType(
         "sglang.srt.managers.scheduler_components.weight_updater"
@@ -286,10 +295,13 @@ def test_scheduler_dispatch_patches_a_late_loaded_dspark_worker(
             pass
 
         def record_weight_version_after_update(self, weight_version):
-            pass
+            recorded_versions.append(weight_version)
 
         def update_weights_from_tensor(self, recv_req):
             return self.draft_worker.update_weights_from_tensor(recv_req)
+
+    if not records_weight_version:
+        del SchedulerWeightUpdaterManager.record_weight_version_after_update
 
     weight_updater.SchedulerWeightUpdaterManager = SchedulerWeightUpdaterManager
     weight_updater.UpdateWeightsFromTensorReqOutput = (
@@ -316,11 +328,12 @@ def test_scheduler_dispatch_patches_a_late_loaded_dspark_worker(
         _request(
             [("markov_head.weight", 9)],
             load_format=DRAFT_LOADER,
-            weight_version=None,
+            weight_version="v7",
         )
     )
 
     assert result.success
+    assert recorded_versions == (["v7"] if records_weight_version else [])
     assert worker.draft_model_runner.model.weights == {"markov_head.weight": 9}
     assert worker.target_worker.model_runner.model.weights == {}
     assert worker.draft_model_runner.weight_updater.load_formats == [None]
