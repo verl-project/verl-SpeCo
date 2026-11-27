@@ -1194,6 +1194,15 @@ _VARIANT_RUNTIME_ALIASES: dict[str, tuple[str, tuple[str, ...]]] = {
             "num_target_layers",
             "target_num_hidden_layers",
             "mask_token_id",
+            # GLM-5 MLA draft topology.
+            "draft_attn",
+            "q_lora_rank",
+            "kv_lora_rank",
+            "qk_nope_head_dim",
+            "qk_rope_head_dim",
+            "v_head_dim",
+            "rope_interleave",
+            "rope_parameters",
         ),
     ),
     "dsv4_dspark": (
@@ -1508,6 +1517,16 @@ def _rewrite_standalone_block_runtime_config(
             "Source drafter config is unavailable; deriving runtime config from SpeCo training config"
         )
 
+    draft_attn = str(
+        runtime_config.get("draft_attn") or training_config.get("draft_attn") or ""
+    ).lower()
+    if not draft_attn:
+        draft_attn = (
+            "mla"
+            if runtime_config.get("kv_lora_rank") is not None
+            and runtime_config.get("qk_rope_head_dim") is not None
+            else "gqa"
+        )
     if (
         source_runtime_config is None
         and backend_type == "dspark"
@@ -1518,8 +1537,14 @@ def _rewrite_standalone_block_runtime_config(
     ):
         # save_pretrained records SpeCo's training class name. vLLM uses that
         # name for DeepSeek-V4, so export the identity of this draft backbone.
-        runtime_config["model_type"] = "qwen3"
-        runtime_config["architectures"] = ["Qwen3DSparkModel"]
+        if draft_attn == "mla":
+            # GLM-5 MLA drafts are dispatched by ``glm5_dspark`` on the serving
+            # side while keeping the DSpark architecture entry point.
+            runtime_config["model_type"] = "glm5_dspark"
+            runtime_config["architectures"] = ["DSparkDraftModel"]
+        else:
+            runtime_config["model_type"] = "qwen3"
+            runtime_config["architectures"] = ["Qwen3DSparkModel"]
 
     runtime_config["speco_training_model_type"] = backend_type
     common_alias_keys = ("target_layer_ids", "mask_token_id", "num_context_layers")

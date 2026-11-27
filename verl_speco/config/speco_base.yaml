@@ -437,6 +437,10 @@ actor_rollout_ref:
         dspark_hard_collect_window_size: 0
         dspark_hidden_size: null
         dspark_intermediate_size: null
+        # Draft attention backbone: "gqa" (Qwen3-style DFlash) or "mla"
+        # (GLM-5/DeepSeek-style latent KV). MLA fields are derived from the
+        # target config; it cannot be combined with dspark_sliding_window.
+        dspark_draft_attn: gqa
         dspark_sliding_window: null
         dspark_num_target_layers: 5
         dspark_num_hidden_layers: 5

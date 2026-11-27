@@ -18,7 +18,11 @@ from typing import Optional
 import torch
 import torch.nn as nn
 
-from verl_speco.models.dflash import DFlashDraftModel
+from verl_speco.models.dflash import (
+    DFlashDecoderLayer,
+    DFlashDraftModel,
+    DFlashMLADecoderLayer,
+)
 
 from .configuration_dspark import DSparkConfig
 
@@ -175,6 +179,14 @@ class DSparkConfidenceHead(nn.Module):
 
 class DSparkDraftModel(DFlashDraftModel):
     config_class = DSparkConfig
+
+    def _build_decoder_layers(self, config: DSparkConfig) -> nn.ModuleList:
+        layer_cls = (
+            DFlashMLADecoderLayer
+            if getattr(config, "draft_attn", "gqa") == "mla"
+            else DFlashDecoderLayer
+        )
+        return nn.ModuleList([layer_cls(config) for _ in range(self.num_layers)])
 
     def __init__(self, config: DSparkConfig):
         super().__init__(config)

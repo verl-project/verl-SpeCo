@@ -106,6 +106,10 @@ DSPARK_SAMPLED_CE_NEGATIVES=${DSPARK_SAMPLED_CE_NEGATIVES:-0}
 DSPARK_LOSS_DECAY_GAMMA=${DSPARK_LOSS_DECAY_GAMMA:-4}
 DSPARK_NUM_TARGET_LAYERS=${DSPARK_NUM_TARGET_LAYERS:-5}
 DSPARK_NUM_HIDDEN_LAYERS=${DSPARK_NUM_HIDDEN_LAYERS:-5}
+# Draft attention backbone: gqa (Qwen3-style) or mla (GLM-5/DeepSeek-style).
+DSPARK_DRAFT_ATTN=${DSPARK_DRAFT_ATTN:-gqa}
+# null inherits the target FFN width; set a positive int to shrink the drafter.
+DSPARK_INTERMEDIATE_SIZE=${DSPARK_INTERMEDIATE_SIZE:-null}
 VLLM_AUX_HIDDEN_STATE_LAYER_IDS=${VLLM_AUX_HIDDEN_STATE_LAYER_IDS:-'[1,9,17,25,33]'}
 DSPARK_MARKOV_RANK=${DSPARK_MARKOV_RANK:-256}
 DSPARK_MARKOV_HEAD_TYPE=${DSPARK_MARKOV_HEAD_TYPE:-vanilla}
@@ -183,6 +187,8 @@ PYTHONUNBUFFERED=1 "${PYTHON_BIN}" -m verl_speco.standalone_tq_training_launcher
     actor_rollout_ref.rollout.drafter.training.dspark_loss_decay_gamma=${DSPARK_LOSS_DECAY_GAMMA} \
     actor_rollout_ref.rollout.drafter.training.dspark_num_target_layers=${DSPARK_NUM_TARGET_LAYERS} \
     actor_rollout_ref.rollout.drafter.training.dspark_num_hidden_layers=${DSPARK_NUM_HIDDEN_LAYERS} \
+    actor_rollout_ref.rollout.drafter.training.dspark_draft_attn=${DSPARK_DRAFT_ATTN} \
+    actor_rollout_ref.rollout.drafter.training.dspark_intermediate_size=${DSPARK_INTERMEDIATE_SIZE} \
     speco.standalone_tq_producer.vllm_aux_hidden_state_layer_ids=${VLLM_AUX_HIDDEN_STATE_LAYER_IDS} \
     actor_rollout_ref.rollout.drafter.training.dspark_markov_rank=${DSPARK_MARKOV_RANK} \
     actor_rollout_ref.rollout.drafter.training.dspark_markov_head_type=${DSPARK_MARKOV_HEAD_TYPE} \

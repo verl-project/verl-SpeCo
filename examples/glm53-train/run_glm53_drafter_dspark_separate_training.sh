@@ -53,6 +53,11 @@ export DSPARK_NUM_TARGET_LAYERS=5
 # Drafter 自身的 Transformer 层数。
 export DSPARK_NUM_HIDDEN_LAYERS=5
 
+# GLM-5.3 目标使用 DeepSeek 风格的 dense MLA；草稿主干随之切换到 MLA。
+# MLA 的 q_lora_rank/kv_lora_rank/qk_*_head_dim/v_head_dim 由目标 config 自动读取，
+# 导出时 model_type 为 glm5_dspark、architectures 为 DSparkDraftModel。
+export DSPARK_DRAFT_ATTN=mla
+
 export DSPARK_BLOCK_SIZE=8
 export DSPARK_NUM_ANCHORS=512
 export DSPARK_MARKOV_RANK=256
