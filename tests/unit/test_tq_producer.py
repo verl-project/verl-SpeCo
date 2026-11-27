@@ -29,6 +29,7 @@ torch = pytest.importorskip("torch")
 from verl_speco.producer.vllm_feature_client import RawVllmFeature
 from verl_speco.standalone_tq_producer import (
     _drain_pending_samples,
+    _load_target_depth,
     run_producer,
     validate_producer_config,
 )
@@ -2049,3 +2050,103 @@ def test_eagle3_filters_short_reference_and_fills_batch_budget(tmp_path, monkeyp
     assert all(len(entry.tag["request"]["feature_positions"]) == 5 for entry in entries)
     batch = store.prepare_batch(entries, pin_memory=False)
     assert batch["input_ids"].shape == (1, 6)
+
+
+def test_load_target_depth_prefers_local_config(tmp_path, monkeypatch):
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {
+                "model_type": "deepseek_v41",
+                "text_config": {"num_hidden_layers": 40},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    def fail_autoconfig(*args, **kwargs):
+        raise AssertionError("AutoConfig should not be called for a local config")
+
+    monkeypatch.setattr("transformers.AutoConfig.from_pretrained", fail_autoconfig)
+
+    assert _load_target_depth(str(tmp_path), False) == 40
+
+
+def test_load_target_depth_accepts_top_level_config(tmp_path, monkeypatch):
+    (tmp_path / "config.json").write_text(
+        json.dumps({"num_hidden_layers": 12}), encoding="utf-8"
+    )
+
+    def fail_autoconfig(*args, **kwargs):
+        raise AssertionError("AutoConfig should not be called for a local config")
+
+    monkeypatch.setattr("transformers.AutoConfig.from_pretrained", fail_autoconfig)
+
+    assert _load_target_depth(str(tmp_path), True) == 12
+
+
+def test_load_target_depth_falls_back_to_autoconfig(tmp_path, monkeypatch):
+    (tmp_path / "config.json").write_text("{not-json", encoding="utf-8")
+
+    class _TextConfig:
+        num_hidden_layers = 7
+
+    class _Config:
+        text_config = _TextConfig()
+
+    monkeypatch.setattr(
+        "transformers.AutoConfig.from_pretrained",
+        lambda *args, **kwargs: _Config(),
+    )
+
+    assert _load_target_depth(str(tmp_path), True) == 7
+
+
+def test_load_target_depth_uses_top_level_when_text_config_lacks_depth(
+    tmp_path, monkeypatch
+):
+    (tmp_path / "config.json").write_text(
+        json.dumps(
+            {"text_config": {"model_type": "deepseek_v41"}, "num_hidden_layers": 9}
+        ),
+        encoding="utf-8",
+    )
+
+    def fail_autoconfig(*args, **kwargs):
+        raise AssertionError("AutoConfig should not be called for a local config")
+
+    monkeypatch.setattr("transformers.AutoConfig.from_pretrained", fail_autoconfig)
+
+    assert _load_target_depth(str(tmp_path), False) == 9
+
+
+def test_load_target_depth_ignores_unparseable_local_value(tmp_path, monkeypatch):
+    (tmp_path / "config.json").write_text(
+        json.dumps({"num_hidden_layers": "not-a-number"}), encoding="utf-8"
+    )
+
+    class _TextConfig:
+        num_hidden_layers = 7
+
+    class _Config:
+        text_config = _TextConfig()
+
+    monkeypatch.setattr(
+        "transformers.AutoConfig.from_pretrained",
+        lambda *args, **kwargs: _Config(),
+    )
+
+    assert _load_target_depth(str(tmp_path), True) == 7
+
+
+def test_load_target_depth_skips_non_positive_local_value(tmp_path, monkeypatch):
+    (tmp_path / "config.json").write_text(
+        json.dumps({"text_config": {"num_hidden_layers": 0}, "num_hidden_layers": 9}),
+        encoding="utf-8",
+    )
+
+    def fail_autoconfig(*args, **kwargs):
+        raise AssertionError("AutoConfig should not be called for a local config")
+
+    monkeypatch.setattr("transformers.AutoConfig.from_pretrained", fail_autoconfig)
+
+    assert _load_target_depth(str(tmp_path), False) == 9

@@ -16,10 +16,12 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import math
 import os
 import time
+from pathlib import Path
 from collections import Counter, deque
 from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
@@ -2133,6 +2135,32 @@ async def _drain_pending_samples(
 
 
 def _load_target_depth(model_path: str, trust_remote_code: bool) -> int:
+    # DeepSeek-V4.1 ships a custom ``deepseek_v41`` config that public
+    # Transformers does not know yet. The producer only needs the depth, so
+    # read a local config.json directly and fall back to AutoConfig for hub
+    # ids / remote-code checkpoints.
+    config_path = Path(model_path) / "config.json"
+    if config_path.is_file():
+        try:
+            raw = json.loads(config_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            raw = None
+        if isinstance(raw, dict):
+            text_config = raw.get("text_config")
+            candidates = []
+            if isinstance(text_config, dict):
+                candidates.append(text_config.get("num_hidden_layers"))
+            candidates.append(raw.get("num_hidden_layers"))
+            for depth in candidates:
+                if depth is None:
+                    continue
+                try:
+                    value = int(depth)
+                except (TypeError, ValueError):
+                    continue
+                if value > 0:
+                    return value
+
     from transformers import AutoConfig
 
     config = AutoConfig.from_pretrained(model_path, trust_remote_code=trust_remote_code)
