@@ -9,6 +9,7 @@ on:
     paths:
       - ".github/workflows/npu_vllm_unit_tests.yml"
       - "ci/run_example_test.sh"
+      - "ci/prepare_npu_models.py"
       - "ci/check_result.py"
       - "ci/online_smoke_profile.json"
       - "examples/*vllm*.sh"
@@ -21,6 +22,7 @@ on:
     paths:
       - ".github/workflows/npu_vllm_unit_tests.yml"
       - "ci/run_example_test.sh"
+      - "ci/prepare_npu_models.py"
       - "ci/check_result.py"
       - "ci/online_smoke_profile.json"
       - "examples/*vllm*.sh"
@@ -170,11 +172,13 @@ jobs:
 
       - name: Prepare model cache
         run: |
-          test -d /root/.cache/huggingface/hub
+          mkdir -p /root/.cache/huggingface/hub
           find /root/.cache/huggingface/hub -maxdepth 5 -name config.json -print
 
       - name: Verify model paths
+        id: models
         env:
+          SPECO_NPU_MODEL_STAGE_DIR: ${{ vars.SPECO_NPU_MODEL_STAGE_DIR || '/tmp/speco-npu-models' }}
           SPECO_TARGET_MODEL: ${{ inputs.target_model || env.SPECO_DEFAULT_TARGET_MODEL }}
           SPECO_EAGLE3_DRAFT_MODEL: ${{ inputs.eagle3_draft_model || env.SPECO_DEFAULT_EAGLE3_DRAFT_MODEL }}
           SPECO_DFLASH_DRAFT_MODEL: ${{ inputs.dflash_draft_model || env.SPECO_DEFAULT_DFLASH_DRAFT_MODEL }}
@@ -194,12 +198,13 @@ jobs:
 
           test -d "${SPECO_TARGET_MODEL}" || {
             echo "Missing target model directory: ${SPECO_TARGET_MODEL}" >&2
-            exit 2
+            echo "The pinned snapshot will be downloaded before launch"
           }
           test -d "${draft_model}" || {
             echo "Missing ${{ matrix.drafter }} draft model directory: ${draft_model}" >&2
-            exit 2
+            echo "The pinned snapshot will be downloaded before launch"
           }
+          python ci/prepare_npu_models.py "${{ matrix.drafter }}"
 
       - name: Verify NPU runtime
         run: |
@@ -215,10 +220,10 @@ jobs:
       - name: Run example script
         env:
           PYTHONPATH: /usr/local/Ascend/ascend-toolkit/latest/python/site-packages:/usr/local/Ascend/cann-9.0.0/python/site-packages:${{ github.workspace }}
-          SPECO_TARGET_MODEL: ${{ inputs.target_model || env.SPECO_DEFAULT_TARGET_MODEL }}
-          SPECO_EAGLE3_DRAFT_MODEL: ${{ inputs.eagle3_draft_model || env.SPECO_DEFAULT_EAGLE3_DRAFT_MODEL }}
-          SPECO_DFLASH_DRAFT_MODEL: ${{ inputs.dflash_draft_model || env.SPECO_DEFAULT_DFLASH_DRAFT_MODEL }}
-          SPECO_DSPARK_DRAFT_MODEL: ${{ inputs.dspark_draft_model || env.SPECO_DEFAULT_DSPARK_DRAFT_MODEL }}
+          SPECO_TARGET_MODEL: ${{ steps.models.outputs.target_model }}
+          SPECO_EAGLE3_DRAFT_MODEL: ${{ steps.models.outputs.draft_model }}
+          SPECO_DFLASH_DRAFT_MODEL: ${{ steps.models.outputs.draft_model }}
+          SPECO_DSPARK_DRAFT_MODEL: ${{ steps.models.outputs.draft_model }}
           SPECO_TRAIN_FILE: ${{ inputs.train_file || env.SPECO_DEFAULT_TRAIN_FILE }}
           SPECO_TEST_FILE: ${{ inputs.test_file || env.SPECO_DEFAULT_TEST_FILE }}
           SPECO_CI_RESULT_PATH: outputs/npu-ci/${{ matrix.drafter }}/result.json
@@ -281,3 +286,18 @@ jobs:
             outputs/npu-ci/${{ matrix.drafter }}/result.json.timing.json
             outputs/npu-ci/${{ matrix.drafter }}/diagnostics/
           if-no-files-found: warn
+
+      - name: Clean staged model files
+        if: always() && steps.models.outputs.staging_root != ''
+        env:
+          STAGING_ROOT: ${{ steps.models.outputs.staging_root }}
+          STAGING_BASE: ${{ vars.SPECO_NPU_MODEL_STAGE_DIR || '/tmp/speco-npu-models' }}
+        run: |
+          python - <<'PY'
+          import os, shutil
+          from pathlib import Path
+          path = Path(os.environ["STAGING_ROOT"])
+          if not path.is_absolute() or path.is_symlink() or path.parent.resolve() != Path(os.environ["STAGING_BASE"]).resolve():
+              raise ValueError("Invalid staging directory")
+          shutil.rmtree(path)
+          PY

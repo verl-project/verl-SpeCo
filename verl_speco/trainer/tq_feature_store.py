@@ -165,51 +165,9 @@ class TQFeatureStore:
             )
         return samples
 
-    def prepare_batch(self, entries: Sequence[ReadyEntry], **options) -> dict[str, Any]:
-        """Materialize only scheduler-assigned file tags; never fetch TQ fields."""
-        import torch
-
-        from verl_speco.trainer.standalone_batch_prepare import (
-            prepare_standalone_cpu_batch,
-        )
-        from verl_speco.trainer.target_feature_replay import FeatureContract
-        from verl_speco.transport.drafter_sample_protocol import (
-            SampleMetadata,
-            make_sample_key,
-        )
-
-        self._require_connected()
-        if not entries:
-            raise ValueError("Cannot prepare an empty file batch")
-        expected = self.expected_config
-        for entry in entries:
-            meta = SampleMetadata.from_dict(entry.tag)
-            if meta.run_id != self.run_id or entry.key != make_sample_key(meta):
-                raise ValueError("Hidden reference identity mismatch")
-            contract = entry.tag["feature_contract"]
-            for name, actual in (
-                ("algorithm", contract.get("algorithm")),
-                ("target_model_path", contract.get("target_model_id")),
-                ("target_revision", contract.get("target_model_revision")),
-                ("tokenizer_fingerprint", contract.get("tokenizer_fingerprint")),
-                ("hidden_states_layout", contract.get("hidden_states_layout")),
-                ("hidden_dtype", str(contract.get("dtype", "")).removeprefix("torch.")),
-                ("target_layer_ids", tuple(contract.get("target_layer_ids", []))),
-            ):
-                wanted = getattr(expected, name)
-                if wanted is not None and actual != wanted:
-                    raise ValueError(
-                        f"Unexpected file feature {name}: {actual!r} != {wanted!r}"
-                    )
-        values = dict(entries[0].tag["feature_contract"])
-        values["dtype"] = getattr(torch, values["dtype"].removeprefix("torch."))
-        return prepare_standalone_cpu_batch(
-            [entry.tag for entry in entries],
-            FeatureContract(**values),
-            hidden_states_store=getattr(self, "hidden_states_store", None),
-            read_timeout=float(self.config.get("io_timeout_seconds", 30)),
-            **options,
-        )
+    # Some scheduled callers can still materialize file tags through this adapter.
+    prepare_batch = ReferenceFeatureStore.prepare_batch
+    reference_contract = ReferenceFeatureStore.reference_contract
 
     def clear_many(self, keys: Sequence[str]) -> None:
         self._require_connected()

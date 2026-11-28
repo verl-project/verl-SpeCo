@@ -25,6 +25,69 @@ pytest.importorskip("torch")
 from verl_speco.producer import input_reader
 
 
+def test_source_route_waves_keep_resume_routes_and_bind_endpoint_order():
+    from verl_speco.producer.source_routing import iter_source_route_waves
+
+    requests = [input_reader.GenerationRequest(i, str(i), tuple(range(length)), 1, {})
+                for i, length in enumerate([2, 8, 3, 7, 4])]
+    settings = dict(wave_samples=4, endpoints=["source-a", "source-b"], max_samples=4,
+                    max_tokens=32, max_sequence_tokens=16)
+    full = list(iter_source_route_waves(requests, **settings))
+    resumed = list(iter_source_route_waves(requests, consumed=[0, 2], **settings))
+    assert resumed == [request for request in full if request.sequence_no not in {0, 2}]
+    assert len({request.source_plan_sha256 for request in full[:4]}) == 1
+    assert full[4].source_plan_sha256 != full[0].source_plan_sha256
+    reversed_sources = list(iter_source_route_waves(requests, **dict(settings, endpoints=["source-b", "source-a"])))
+    assert reversed_sources[0].source_plan_sha256 != full[0].source_plan_sha256
+    with pytest.raises(ValueError, match="increasing"):
+        list(iter_source_route_waves([requests[1], requests[0]], **settings))
+    def oversized():
+        yield input_reader.GenerationRequest(0, "large", tuple(range(17)), 1, {})
+        raise AssertionError("Must reject oversized input before reading another request")
+    with pytest.raises(ValueError, match="token limits"):
+        list(iter_source_route_waves(oversized(), **settings))
+
+    # Total tokens fit, but three four-token requests cannot fit two six-token sources.
+    split_requests = [input_reader.GenerationRequest(i, str(i), (1, 2, 3, 4), 0, {}) for i in range(3)]
+    split_settings = dict(settings, max_tokens=6)
+    routed = list(iter_source_route_waves(split_requests, **split_settings))
+    assert [item.sequence_no for item in routed] == [0, 1, 2]
+    assert len({item.source_plan_sha256 for item in routed}) == 2
+    assert list(iter_source_route_waves(split_requests, consumed=[0], **split_settings)) == routed[1:]
+    for digest in {item.source_plan_sha256 for item in routed}:
+        for route in range(2):
+            assigned = [item for item in routed if item.source_plan_sha256 == digest and item.source_route == route]
+            assert sum(len(item.prompt_token_ids) for item in assigned) <= 6
+
+
+def test_source_route_plan_preserves_order_and_enforces_wave_capacity():
+    from verl_speco.producer.source_routing import plan_source_routes
+
+    limits = dict(source_count=3, max_samples=2, max_tokens=12, max_sequence_tokens=10)
+    lengths = [2, 10, 3, 9]
+    plan = plan_source_routes(iter(lengths), **limits)
+    assert plan == plan_source_routes(lengths, **limits)
+    assert plan["routes"] == [2, 0, 2, 1]
+    assert plan["lengths"] == lengths
+    for source in range(3):
+        assigned = [length for length, route in zip(lengths, plan["routes"]) if route == source]
+        assert len(assigned) <= 2 and sum(assigned) <= 12
+    assert plan_source_routes([10], **limits)["routes"] == [0]
+    assert plan_source_routes([], **limits)["routes"] == []
+    with pytest.raises(ValueError, match="token limits"):
+        plan_source_routes([11], **limits)
+    with pytest.raises(ValueError, match="sample capacity"):
+        plan_source_routes([1] * 7, **limits)
+    with pytest.raises(ValueError, match="cannot fit"):
+        plan_source_routes([8] * 4, **limits)
+    changed = plan_source_routes(lengths, **dict(limits, max_tokens=13))
+    assert changed["sha256"] != plan["sha256"]
+    packed = plan_source_routes(
+        [3, 3, 2, 2, 2], source_count=2, max_samples=3, max_tokens=6, max_sequence_tokens=6
+    )
+    assert packed["routes"] == [0, 0, 1, 1, 1]
+
+
 def _tool_row(sample_id="tool-a"):
     return {
         "sample_id": sample_id,
@@ -125,13 +188,41 @@ def test_jsonl_array_first_line_respects_skip_policy(tmp_path, suffix, order):
 
 
 @pytest.mark.parametrize("suffix", [".json", ".JSON"])
-def test_json_array_skips_invalid_tool_rows_in_both_readers(tmp_path, suffix):
+@pytest.mark.parametrize("encoding", ["utf-8", "utf-8-sig"])
+def test_json_array_skips_invalid_tool_rows_in_both_readers(tmp_path, suffix, encoding):
     path = tmp_path / f"input{suffix}"
     bad = {**_tool_row("bad"), "tools": "invalid"}
-    path.write_text(json.dumps([_tool_row(), bad, _tool_row("tool-b")]), encoding="utf-8")
+    path.write_text(json.dumps([_tool_row(), bad, _tool_row("tool-b")]), encoding=encoding)
     readers = [input_reader.iter_input_records(path), input_reader.ShuffledJsonlReader(path).iter_records([0, 1, 2])]
     for reader in readers:
         assert [record.sample_id for record in reader] == ["tool-a", "tool-b"]
+
+
+@pytest.mark.parametrize("shuffled", [False, True])
+def test_json_array_size_bound_precedes_decoding(tmp_path, monkeypatch, shuffled):
+    path = tmp_path / "large.json"
+    path.write_text(json.dumps([_tool_row()]), encoding="utf-8")
+    def read(limit):
+        if shuffled:
+            reader = input_reader.ShuffledJsonlReader(path, max_json_array_bytes=limit)
+            return list(reader.iter_records([0]))
+        return list(input_reader.iter_input_records(path, max_json_array_bytes=limit))
+    with pytest.raises(ValueError, match="max_json_array_bytes=8"):
+        read(8)
+    assert len(read(0)) == 1
+    assert len(read(path.stat().st_size)) == 1
+
+
+def test_json_array_record_limit_and_string_tools_are_rejected(tmp_path):
+    path = tmp_path / "input.json"
+    path.write_text(json.dumps([_tool_row(), _tool_row("other")]), encoding="utf-8")
+    with pytest.raises(ValueError, match="max_indexed_records"):
+        input_reader.ShuffledJsonlReader(path, max_indexed_records=1)
+    row = {"prompt": "hello", "tools": _tool_row()["tools"]}
+    with pytest.raises(ValueError, match="chat-message prompt"):
+        input_reader._record_from_payload(row, "test", 0, False)
+    with pytest.raises(ValueError, match="chat-message prompt"):
+        input_reader._prompt_ids("hello", None, tools=row["tools"])
 
 
 @pytest.mark.parametrize("response_budget", [0, 2, 3])
@@ -311,12 +402,59 @@ def test_shuffled_jsonl_reader_skips_invalid_lines(tmp_path: Path) -> None:
     assert [r.sample_id for r in records] == ["a", "b"]
 
 
+def test_shuffled_implicit_ids_can_follow_original_rows(tmp_path: Path) -> None:
+    input_path = tmp_path / "train.jsonl"
+    input_path.write_text('\n'.join([json.dumps({"prompt": "a", "response": "x"}), "{bad",
+                                     json.dumps({"prompt": "b", "response": "y"})]) + '\n', encoding="utf-8")
+    reader = input_reader.ShuffledJsonlReader(input_path, stable_source_ids=True)
+    first = list(reader.iter_records([2, 1, 0]))
+    second = list(reader.iter_records([0, 1, 2]))
+    assert [(record.sequence_no, record.sample_id) for record in first] == [(0, "train-000002"), (1, "train-000000")]
+    assert {record.prompt: record.sample_id for record in first} == {record.prompt: record.sample_id for record in second}
+    legacy = list(input_reader.ShuffledJsonlReader(input_path).iter_records([2, 0]))
+    assert [record.sample_id for record in legacy] == ["train-000000", "train-000001"]
+
+
 def test_shuffled_jsonl_reader_rejects_parquet(tmp_path: Path) -> None:
     input_path = tmp_path / "train.parquet"
     input_path.write_bytes(b"PAR1-fixture")
 
     with pytest.raises(input_reader.ShuffledInputUnsupportedError):
         input_reader.ShuffledJsonlReader(input_path)
+
+
+def test_jsonl_limits_apply_to_sequential_and_shuffled_readers(tmp_path: Path) -> None:
+    path = tmp_path / "train.jsonl"
+    row = (json.dumps({"prompt": "中文", "response": "x"}, ensure_ascii=False) + "\n").encode()
+    path.write_bytes(row * 3)
+    with pytest.raises(ValueError, match="max_jsonl_line_bytes"):
+        list(input_reader.iter_input_records(path, max_jsonl_line_bytes=len(row) - 1))
+    with pytest.raises(ValueError, match="max_jsonl_line_bytes"):
+        input_reader.ShuffledJsonlReader(path, max_jsonl_line_bytes=len(row) - 1)
+    assert len(list(input_reader.iter_input_records(path, max_jsonl_line_bytes=0))) == 3
+    with pytest.raises(ValueError, match="max_indexed_records"):
+        input_reader.ShuffledJsonlReader(path, max_indexed_records=2)
+    assert input_reader.ShuffledJsonlReader(path, max_indexed_records=0).record_count == 3
+
+
+def test_shuffled_reader_rejects_mid_epoch_edit_and_metadata_preserving_edit(tmp_path: Path) -> None:
+    import os
+
+    path = tmp_path / "train.jsonl"
+    row = json.dumps({"prompt": "a", "response": "x"}) + "\n"
+    path.write_text(row * 2, encoding="utf-8")
+    reader = input_reader.ShuffledJsonlReader(path)
+    records = reader.iter_records([0, 1])
+    next(records)
+    path.write_text(row * 3, encoding="utf-8")
+    with pytest.raises(ValueError, match="changed after indexing"):
+        next(records)
+    reader = input_reader.ShuffledJsonlReader(path, verify_indexed_input=True)
+    stat = path.stat()
+    path.write_text((row * 3).replace('"prompt": "a"', '"prompt": "b"', 1), encoding="utf-8")
+    os.utime(path, ns=(stat.st_atime_ns, stat.st_mtime_ns))
+    with pytest.raises(ValueError, match="changed after indexing"):
+        list(reader.iter_records([0]))
 
 
 def test_iter_input_records_reads_parquet_rows(monkeypatch, tmp_path: Path) -> None:
@@ -614,3 +752,46 @@ def test_minimum_feature_rows_applies_after_window_selection(feature_rows):
     else:
         request = input_reader._build_tokenized_request(**kwargs)
         assert request.feature_positions.numel() == feature_rows
+
+
+def test_source_proportional_order_preserves_rows_and_stable_fallback_identity(tmp_path):
+    path = tmp_path / "rows.jsonl"
+    rows = [{"prompt": "q", "response": "a", "source": source}
+            for source in ["a", "a", "a", "b", "b", "c"]]
+    path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+    reader = input_reader.ShuffledJsonlReader(path, source_field="source", on_error="raise")
+    order = list(reader.source_proportional_order())
+    assert sorted(order) == list(range(6))
+    assert [rows[index]["source"] for index in order] == ["a", "b", "a", "c", "b", "a"]
+    shuffled = list(reader.source_proportional_order(seed=42))
+    assert sorted(shuffled) == list(range(6))
+    assert shuffled == list(reader.source_proportional_order(seed=42))
+    records = list(reader.iter_records(shuffled))
+    assert [item.sample_id for item in records] == [f"train-{index:06d}" for index in shuffled]
+    assert [item.sequence_no for item in records] == list(range(len(records)))
+    import os
+    stat = path.stat()
+    path.write_text(path.read_text(encoding="utf-8").replace('"source": "a"', '"source": "z"', 1), encoding="utf-8")
+    os.utime(path, ns=(stat.st_atime_ns, stat.st_mtime_ns))
+    with pytest.raises(ValueError, match="changed after indexing"):
+        list(reader.iter_records(order))
+
+
+@pytest.mark.parametrize("value", [None, "", 3, []])
+def test_source_proportional_order_requires_valid_source_labels(tmp_path, value):
+    path = tmp_path / "rows.jsonl"
+    path.write_text(json.dumps({"prompt": "q", "response": "a", "source": value}) + "\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="Invalid source label"):
+        input_reader.ShuffledJsonlReader(path, source_field="source")
+
+
+def test_json_array_preserves_source_proportional_stable_occurrences(tmp_path):
+    rows = [{**_tool_row(str(i)), "source": source} for i, source in enumerate(["a", "a", "b"])]
+    path = tmp_path / "input.json"
+    path.write_text(json.dumps(rows), encoding="utf-8")
+    reader = input_reader.ShuffledJsonlReader(path, source_field="source", stable_source_ids=True)
+    order = list(reader.source_proportional_order())
+    records = list(reader.iter_records(order))
+    assert sorted(record.sample_id for record in records) == ["0", "1", "2"]
+    assert [record.sequence_no for record in records] == [0, 1, 2]
+    assert order == list(reader.source_proportional_order())

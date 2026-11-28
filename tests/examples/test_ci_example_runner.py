@@ -30,6 +30,95 @@ WORKFLOWS = ROOT / ".github" / "workflows"
 RUNNER = ROOT / "ci" / "run_example_test.sh"
 
 
+@pytest.mark.parametrize("missing", [False, True])
+def test_npu_model_preparation_stages_complete_pinned_snapshots(tmp_path, missing):
+    from ci.prepare_npu_models import complete, prepare
+    source = tmp_path / "cached"
+    source.mkdir()
+    (source / "config.json").write_text("{}")
+    (source / "model.safetensors").write_bytes(b"weights")
+    pinned = tmp_path / "models--deepseek-ai--dspark_qwen3_8b_block7" / "snapshots" / ("a" * 40)
+    calls = []
+    def download(**kwargs):
+        calls.append(kwargs)
+        return str(source)
+    staged = prepare(pinned if missing else source, tmp_path / "staged", download=download)
+    assert complete(staged) and not (staged / "model.safetensors").is_symlink()
+    assert (staged / "model.safetensors").read_bytes() == b"weights"
+    assert bool(calls) is missing
+    if missing:
+        assert calls[0]["revision"] == "a" * 40
+        assert calls[0]["repo_id"] == "deepseek-ai/dspark_qwen3_8b_block7"
+    (staged / "model.safetensors").write_bytes(b"")
+    assert not complete(staged)
+    with pytest.raises(ValueError, match="Missing or incomplete local model"):
+        prepare(staged, tmp_path / "invalid", download=download)
+
+
+@pytest.mark.parametrize("status,attempts", [(503, 3), (429, 3), (401, 1), (404, 1)])
+def test_npu_model_download_retries_only_transient_http_errors(monkeypatch, status, attempts):
+    from types import SimpleNamespace
+
+    from ci.prepare_npu_models import _download_snapshot
+
+    error = RuntimeError("download failed")
+    error.response = SimpleNamespace(status_code=status)
+    calls, delays = [], []
+    monkeypatch.setattr("ci.prepare_npu_models.time.sleep", delays.append)
+
+    def download(**options):
+        calls.append(options)
+        raise error
+
+    with pytest.raises(RuntimeError, match="download failed"):
+        _download_snapshot(download, repo_id="org/model", revision="a" * 40)
+    assert len(calls) == attempts
+    assert delays == ([15, 30] if attempts == 3 else [])
+    if attempts == 3:
+        calls.clear()
+
+        def recovered(**options):
+            calls.append(options)
+            if len(calls) == 1:
+                raise error
+            return "snapshot"
+
+        assert _download_snapshot(recovered, repo_id="org/model", revision="a" * 40) == "snapshot"
+        assert len(calls) == 2
+
+
+def test_npu_download_uses_metadata_and_pins_all_file_requests(monkeypatch, tmp_path):
+    import sys
+    from types import SimpleNamespace
+
+    from ci.prepare_npu_models import _fetch_snapshot
+
+    revision = "a" * 40
+    filenames = ["nested/tokenizer.json", "config.json", "model.safetensors"]
+    info = SimpleNamespace(sha=revision, siblings=[SimpleNamespace(rfilename=name) for name in filenames])
+    metadata_calls, file_calls = [], []
+
+    def model_info(repo_id, **options):
+        metadata_calls.append((repo_id, options))
+        return info
+
+    def download(**options):
+        file_calls.append(options)
+        return str(tmp_path / options["filename"])
+
+    monkeypatch.setitem(sys.modules, "huggingface_hub", SimpleNamespace(
+        HfApi=lambda: SimpleNamespace(model_info=model_info), hf_hub_download=download,
+    ))
+    assert _fetch_snapshot("org/model", revision) == tmp_path
+    assert metadata_calls == [("org/model", {"revision": revision})]
+    assert {call["filename"] for call in file_calls} == set(filenames)
+    assert all(call["revision"] == revision and call["repo_id"] == "org/model" for call in file_calls)
+    info.sha = "b" * 40
+    with pytest.raises(ValueError, match="requested revision"):
+        _fetch_snapshot("org/model", revision)
+    assert len(file_calls) == len(filenames)
+
+
 def _workflow(name: str) -> dict:
     path = WORKFLOWS / name
     assert path.is_file(), f"missing workflow: {name}"

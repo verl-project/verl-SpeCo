@@ -137,14 +137,16 @@ def test_directory_launch_uses_manifest_layers_and_no_online_services(
     from verl_speco import standalone_ray_runtime as runtime
     from verl_speco import standalone_tq_training_launcher as launcher
 
+    from verl_speco.producer import hidden_states_store
+
     reads = []
-    load_manifest = launcher.load_raw_hidden_manifest
+    load_manifest = hidden_states_store.load_raw_hidden_manifest
 
     def count_read(path):
         reads.append(path)
         return load_manifest(path)
 
-    monkeypatch.setattr(launcher, "load_raw_hidden_manifest", count_read)
+    monkeypatch.setattr(hidden_states_store, "load_raw_hidden_manifest", count_read)
 
     commands, producer, consumer = pipeline(dataset)
     assert len(reads) == 1

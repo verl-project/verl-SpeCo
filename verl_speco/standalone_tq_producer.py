@@ -39,6 +39,8 @@ from verl_speco.producer.hidden_states_store import (
     build_hidden_states_store,
 )
 from verl_speco.producer.input_reader import (
+    DEFAULT_MAX_INDEXED_RECORDS,
+    DEFAULT_MAX_JSONL_LINE_BYTES,
     GenerationRequest,
     SampleFilteredError,
     ShuffledJsonlReader,
@@ -60,7 +62,13 @@ from verl_speco.producer.vllm_feature_client import (
 )
 from verl_speco.standalone_layer_ids import normalize_standalone_layer_ids
 from verl_speco.trainer.feature_store import DraftFeatureSample
-from verl_speco.trainer.standalone_resume import load_standalone_resume
+from verl_speco.trainer.standalone_resume import (
+    build_input_fingerprint,
+    input_content_identity,
+    load_standalone_resume,
+    producer_data_recipe,
+    validate_input_identity,
+)
 from verl_speco.trainer.standalone_retry import retry_io
 from verl_speco.trainer.target_feature_replay import (
     FeatureContract,
@@ -170,6 +178,27 @@ async def _delete_result_best_effort(result: RawVllmFeature | VllmResponse) -> N
         )
 
 
+async def _finish_reference_io(operation, *, discard=None, should_drain=None):
+    """Resolve in-flight reference I/O before propagating a task cancellation."""
+    task = asyncio.ensure_future(operation)
+    cancelled = None
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError as error:
+            if not task.done() and should_drain is not None and not should_drain():
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+                raise
+            cancelled = error
+    result = task.result()
+    if cancelled is not None:
+        if discard is not None:
+            await _finish_reference_io(discard(result))
+        raise cancelled
+    return result
+
+
 async def publish_one(
     result: PreparedFeature,
     transport: Any,
@@ -276,6 +305,9 @@ def _assert_resume_shuffle_alignment(
     shuffle: bool,
     shuffle_seed: int,
     consumed_sequence_nos: set[int],
+    deterministic_publication: bool = False,
+    source_proportional_field: str | None = None,
+    data_recipe: dict[str, Any] | None = None,
 ) -> None:
     """Refuse a resume whose checkpoint was written under another shuffle config.
 
@@ -288,6 +320,21 @@ def _assert_resume_shuffle_alignment(
     start shuffled freely.
     """
     saved = (resume_metadata or {}).get("producer_shuffle")
+    saved_recipe = saved.get("data_recipe") if saved else None
+    if (
+        consumed_sequence_nos
+        and saved_recipe is not None
+        and saved_recipe != data_recipe
+    ):
+        raise ValueError("Standalone resume Producer data recipe changed")
+    saved_source = saved.get("source_proportional_field") if saved else None
+    if consumed_sequence_nos and saved_source != source_proportional_field:
+        raise ValueError("Standalone resume source-proportional ordering changed")
+    saved_ordered = (
+        bool(saved.get("deterministic_publication", False)) if saved else False
+    )
+    if consumed_sequence_nos and saved_ordered != deterministic_publication:
+        raise ValueError("Standalone resume deterministic publication setting changed")
     if saved is None:
         if shuffle and consumed_sequence_nos:
             raise ValueError(
@@ -351,7 +398,7 @@ def standalone_token_config(producer_cfg, training_cfg):
     return config
 
 
-def validate_producer_config(config: Any) -> str:
+def validate_producer_config(config: Any, *, allow_native: bool = False) -> str:
     producer_cfg, training_cfg, tq_cfg = _config_sections(config)
     required = (
         "input_path",
@@ -364,7 +411,48 @@ def validate_producer_config(config: Any) -> str:
     missing = [name for name in required if not producer_cfg.get(name)]
     if missing:
         raise ValueError(f"standalone_tq_producer missing required fields: {missing}")
-    if bool(producer_cfg.get("shuffle", False)):
+    source_field = producer_cfg.get("source_proportional_field")
+    journal_path = producer_cfg.get("reference_lease_journal_path")
+    if journal_path is not None and (
+        not isinstance(journal_path, str) or not os.path.isabs(journal_path)
+    ):
+        raise ValueError(
+            "reference_lease_journal_path must be an absolute path or null"
+        )
+    for name, default in (
+        ("source_route_wave_samples", 0),
+        ("source_route_max_samples", 64),
+        ("source_route_max_tokens", 1048576),
+        ("source_route_max_sequence_tokens", 65536),
+    ):
+        value = producer_cfg.get(name, default)
+        if type(value) is not int or value < (
+            0 if name == "source_route_wave_samples" else 1
+        ):
+            raise ValueError(f"Invalid {name}")
+    if type(producer_cfg.get("stable_source_ids", False)) is not bool:
+        raise ValueError("stable_source_ids must be a boolean")
+    for name, default in (
+        ("max_jsonl_line_bytes", DEFAULT_MAX_JSONL_LINE_BYTES),
+        ("max_indexed_records", DEFAULT_MAX_INDEXED_RECORDS),
+        ("max_json_array_bytes", 0),
+    ):
+        value = producer_cfg.get(name, default)
+        if type(value) is not int or value < 0:
+            raise ValueError(f"{name} must be a non-negative integer")
+    if type(producer_cfg.get("verify_indexed_input", False)) is not bool:
+        raise ValueError("verify_indexed_input must be a boolean")
+    if source_field is not None and (
+        not isinstance(source_field, str)
+        or not source_field.strip()
+        or source_field != source_field.strip()
+    ):
+        raise ValueError(
+            "source_proportional_field must be a nonempty field name or null"
+        )
+    if os.path.isdir(str(producer_cfg["input_path"])):
+        raise ValueError("Online standalone training requires an input file")
+    if bool(producer_cfg.get("shuffle", False)) or source_field is not None:
         input_path = str(producer_cfg.get("input_path") or "")
         if input_path.lower().endswith((".parquet", ".pq")):
             # No bounded shuffled Parquet reader exists: rows have no cheap
@@ -381,6 +469,19 @@ def validate_producer_config(config: Any) -> str:
         raise ValueError(
             "standalone_tq_producer.vllm_endpoints must be a non-empty list"
         )
+    wave = producer_cfg.get("source_route_wave_samples", 0)
+    if wave:
+        if (
+            not all(isinstance(endpoint, str) for endpoint in endpoints)
+            or len(set(endpoints)) != len(endpoints)
+            or len(endpoints) > 4096
+            or wave
+            > min(
+                5_000_000,
+                len(endpoints) * producer_cfg.get("source_route_max_samples", 64),
+            )
+        ):
+            raise ValueError("Invalid source route endpoints or wave sample capacity")
     algorithm = str(training_cfg.get("speculative_algorithm", "") or "").strip()
     if not algorithm:
         raise ValueError("drafter.speculative_algorithm must not be empty")
@@ -437,7 +538,12 @@ def validate_producer_config(config: Any) -> str:
     if int(producer_cfg.get("vllm_success_log_interval", 100)) < 0:
         raise ValueError("vllm_success_log_interval must be non-negative")
     store_cfg = producer_cfg.get("hidden_states_store")
-    if store_cfg:
+    if store_cfg and store_cfg.get("backend") == "native":
+        if not allow_native:
+            raise ValueError(
+                "Native producer store requires an injected native reference store"
+            )
+    elif store_cfg:
         # Raises on an unsupported backend before the pool is built, without
         # constructing a throwaway store (the pool builds the real one).
         HiddenStatesStoreConfig.from_mapping(store_cfg)
@@ -509,6 +615,55 @@ def _format_perf_sample(row: Mapping[str, Any]) -> str:
         f"active={_timing_value(timing, 'active'):.3f}s "
         f"backpressure={_timing_value(timing, 'backpressure'):.3f}s"
     )
+
+
+@dataclass(frozen=True)
+class _SkippedReference:
+    sequence_no: int
+    release_slot: bool
+
+
+class _OrderedReferenceQueue:
+    """Expose completed references in admitted order with a bounded upstream window."""
+
+    def __init__(self, queue, order_by_sequence, order_slots=None):
+        self.queue = queue
+        self.order_by_sequence = order_by_sequence
+        self.order_slots = order_slots
+        self.next_order = 0
+        self.pending = {}
+        self.ended = False
+
+    async def get(self):
+        while True:
+            while self.next_order not in self.pending:
+                if self.ended:
+                    if self.pending:
+                        raise RuntimeError(
+                            "Ordered publication ended with missing requests"
+                        )
+                    return _PUBLISH_DONE
+                item = await self.queue.get()
+                if item is _PUBLISH_DONE:
+                    self.ended = True
+                    continue
+                sequence_no = int(
+                    item.sequence_no
+                    if isinstance(item, _SkippedReference)
+                    else item.request.sequence_no
+                )
+                order = self.order_by_sequence[sequence_no]
+                if order < self.next_order or order in self.pending:
+                    raise ValueError("Duplicate ordered publication")
+                self.pending[order] = item
+            item = self.pending.pop(self.next_order)
+            self.next_order += 1
+            if isinstance(item, _SkippedReference):
+                del self.order_by_sequence[item.sequence_no]
+                if item.release_slot:
+                    self.order_slots.release()
+                continue
+            return item
 
 
 async def _collect_reference_batch(
@@ -764,12 +919,19 @@ async def run_producer(
     transport: Any = None,
     tokenizer: Any | None = None,
     client_pool: Any | None = None,
+    hidden_states_store: Any | None = None,
     before_request: Any | None = None,
+    acquire_reference_slot: Any | None = None,
+    release_unpublished_slot: Any | None = None,
+    transfer_unpublished_slot: Any | None = None,
+    expected_input_identity: dict[str, Any] | None = None,
     on_published: Any | None = None,
     on_references: Any | None = None,
     reference_batch_size: int = 1,
     on_metrics: Any | None = None,
     get_runtime_state: Any | None = None,
+    is_graceful_stop: Any | None = None,
+    resume_state: tuple[set[int], dict[str, Any]] | None = None,
 ) -> ProducerStats:
     """Publish references from online vLLM or a persistent raw-hidden dataset."""
 
@@ -779,22 +941,71 @@ async def run_producer(
         .get("draft_training", {})
         .get("data_source", "online")
     )
+    should_drain = is_graceful_stop or (lambda: False)
     if source == "saved_hidden":
+
+        async def publish_saved(entries):
+            return await _finish_reference_io(
+                on_references(entries), should_drain=should_drain
+            )
+
         return await _publish_saved_hidden(
             config,
             before_publish=before_request,
-            on_references=on_references,
+            on_references=publish_saved if on_references is not None else None,
             reference_batch_size=reference_batch_size,
             on_metrics=on_metrics,
         )
     if source != "online":
         raise ValueError("data_source must be online or saved_hidden")
-    on_missing_response = validate_producer_config(config)
+    callbacks = (
+        acquire_reference_slot,
+        release_unpublished_slot,
+        transfer_unpublished_slot,
+    )
+    if any(callback is not None for callback in callbacks) and any(
+        callback is None for callback in callbacks
+    ):
+        raise ValueError("Reference execution slot callbacks must be supplied together")
+    if acquire_reference_slot is not None and on_references is None:
+        raise ValueError("Reference execution slots require reference publication")
+    if hidden_states_store is not None and (
+        client_pool is not None or on_references is None
+    ):
+        raise ValueError(
+            "An injected producer store requires reference publication and an internally built client pool"
+        )
+    on_missing_response = validate_producer_config(
+        config, allow_native=getattr(hidden_states_store, "backend", None) == "native"
+    )
     producer_cfg, drafter_cfg, tq_cfg = _config_sections(config)
     run_id = str(tq_cfg["run_id"])
+    if (
+        producer_cfg.get("reference_lease_journal_path") is not None
+        and on_references is None
+    ):
+        raise ValueError(
+            "reference_lease_journal_path requires Ray reference publication"
+        )
     stats = ProducerStats()
     if reference_batch_size < 1:
         raise ValueError("reference_batch_size must be positive")
+    deterministic_publication = producer_cfg.get("deterministic_publication", False)
+    max_ordered_inflight = producer_cfg.get("max_ordered_inflight", 0)
+    if type(deterministic_publication) is not bool:
+        raise ValueError("deterministic_publication must be a boolean")
+    if type(max_ordered_inflight) is not int or max_ordered_inflight < 0:
+        raise ValueError("max_ordered_inflight must be a non-negative integer")
+    if deterministic_publication and on_references is None:
+        raise ValueError("deterministic_publication requires ray_reference publication")
+    if (
+        producer_cfg.get("source_route_wave_samples", 0)
+        and on_references is not None
+        and not deterministic_publication
+    ):
+        raise ValueError(
+            "Fixed source routing requires deterministic_publication for ray_reference publication"
+        )
     max_consecutive_feature_drops = config_int(
         producer_cfg, "max_consecutive_feature_drops", 20
     )
@@ -806,6 +1017,16 @@ async def run_producer(
     feature_executor: ThreadPoolExecutor | None = None
     publish_executor: ThreadPoolExecutor | None = None
     try:
+        if expected_input_identity is not None:
+            fingerprint = await asyncio.to_thread(
+                build_input_fingerprint,
+                producer_cfg["input_path"],
+                include_content_hash=True,
+            )
+            if input_content_identity(fingerprint) != validate_input_identity(
+                expected_input_identity
+            ):
+                raise ValueError("Standalone Producer input changed before reading")
         logger.info(
             "Standalone Producer starting run_id=%s input=%s endpoints=%s",
             run_id,
@@ -840,15 +1061,22 @@ async def run_producer(
             )
             logger.info("Standalone Producer observed owner_ready run_id=%s", run_id)
 
-        consumed_sequence_nos, resume_metadata = load_standalone_resume(
-            producer_cfg.get("resume_checkpoint_path"),
-            input_path=str(producer_cfg["input_path"]),
+        consumed_sequence_nos, resume_metadata = (
+            resume_state
+            if resume_state is not None
+            else load_standalone_resume(
+                producer_cfg.get("resume_checkpoint_path"),
+                input_path=str(producer_cfg["input_path"]),
+            )
         )
         _assert_resume_shuffle_alignment(
             resume_metadata,
             shuffle=bool(producer_cfg.get("shuffle", False)),
             shuffle_seed=int(producer_cfg.get("shuffle_seed", 42)),
             consumed_sequence_nos=consumed_sequence_nos,
+            deterministic_publication=deterministic_publication,
+            source_proportional_field=producer_cfg.get("source_proportional_field"),
+            data_recipe=producer_data_recipe(producer_cfg),
         )
         logger.info(
             "Standalone Producer resume progress checkpoint=%s consumed=%s step=%s",
@@ -874,11 +1102,20 @@ async def run_producer(
                 model=str(producer_cfg["vllm_model"]),
                 max_inflight_requests=int(producer_cfg["max_inflight_requests"]),
                 request_timeout=float(producer_cfg["request_timeout"]),
+                token_balanced=producer_cfg.get("token_balanced", False),
+                max_inflight_tokens=producer_cfg.get("max_inflight_tokens", 0),
+                max_inflight_tokens_per_endpoint=producer_cfg.get(
+                    "max_inflight_tokens_per_endpoint", 0
+                ),
                 success_log_interval=int(
                     producer_cfg.get("vllm_success_log_interval", 100)
                 ),
-                hidden_states_store=build_hidden_states_store(
-                    producer_cfg.get("hidden_states_store")
+                hidden_states_store=(
+                    hidden_states_store
+                    if hidden_states_store is not None
+                    else build_hidden_states_store(
+                        producer_cfg.get("hidden_states_store")
+                    )
                 ),
             )
         await pool.start()
@@ -966,9 +1203,33 @@ async def run_producer(
         publish_queue: asyncio.Queue[Any] = asyncio.Queue(
             maxsize=int(producer_cfg["publish_queue_size"])
         )
+        order_by_sequence: dict[int, int] = {}
+        next_admission_order = 0
+        order_slots = (
+            asyncio.Semaphore(
+                max_ordered_inflight
+                or (worker_count + input_queue.maxsize + publish_queue.maxsize)
+            )
+            if deterministic_publication
+            else None
+        )
+        ordered_publish_queue = (
+            _OrderedReferenceQueue(publish_queue, order_by_sequence, order_slots)
+            if deterministic_publication
+            else publish_queue
+        )
         stages: dict[str, tuple[str, float, str]] = {}
         sample_timings: dict[int, dict[str, float]] = {}
         unsubmitted_references: dict[str, VllmResponse] = {}
+
+        async def discard_reference(raw):
+            await asyncio.to_thread(
+                retry_io,
+                partial(delete_temporary_result, raw),
+                name="Unsubmitted hidden reference cleanup",
+                retry_if=lambda exc: True,
+            )
+
         perf_rows: list[dict[str, Any]] = []
         diagnostics = getattr(pool, "diagnostics", None) or ProducerDiagnostics()
         diagnostics.snapshot()  # Exclude model/client initialization from occupancy.
@@ -1054,8 +1315,9 @@ async def run_producer(
         def iter_requests():
             shuffle = bool(producer_cfg.get("shuffle", False))
             shuffle_seed = int(producer_cfg.get("shuffle_seed", 42))
+            source_field = producer_cfg.get("source_proportional_field")
             shuffled_reader: ShuffledJsonlReader | None = None
-            if shuffle:
+            if shuffle or source_field is not None:
                 # Parquet+shuffle is rejected up front in
                 # validate_producer_config; ShuffledInputUnsupportedError here
                 # only fires for Parquet content behind a non-Parquet name.
@@ -1067,6 +1329,18 @@ async def run_producer(
                     ),
                     parser_strict_roles=bool(
                         producer_cfg.get("parser_strict_roles", False)
+                    ),
+                    source_field=source_field,
+                    stable_source_ids=producer_cfg.get("stable_source_ids", False),
+                    max_json_array_bytes=producer_cfg.get("max_json_array_bytes", 0),
+                    max_jsonl_line_bytes=producer_cfg.get(
+                        "max_jsonl_line_bytes", DEFAULT_MAX_JSONL_LINE_BYTES
+                    ),
+                    max_indexed_records=producer_cfg.get(
+                        "max_indexed_records", DEFAULT_MAX_INDEXED_RECORDS
+                    ),
+                    verify_indexed_input=producer_cfg.get(
+                        "verify_indexed_input", False
                     ),
                 )
                 logger.info(
@@ -1103,13 +1377,24 @@ async def run_producer(
                     # speculators RNG recipe (NumPy default_rng(seed + epoch)
                     # .permutation, cf. distributed_batch_sampler) so the same
                     # seed produces the same order there and here.
-                    record_order = np.random.default_rng(
-                        shuffle_seed + epoch
-                    ).permutation(shuffled_reader.record_count)
+                    if source_field is not None:
+                        record_order = shuffled_reader.source_proportional_order(
+                            seed=shuffle_seed + epoch if shuffle else None
+                        )
+                    else:
+                        record_order = np.random.default_rng(
+                            shuffle_seed + epoch
+                        ).permutation(shuffled_reader.record_count)
                     record_iter = shuffled_reader.iter_records(record_order)
                 else:
                     record_iter = iter_input_records(
                         str(producer_cfg["input_path"]),
+                        max_json_array_bytes=producer_cfg.get(
+                            "max_json_array_bytes", 0
+                        ),
+                        max_jsonl_line_bytes=producer_cfg.get(
+                            "max_jsonl_line_bytes", DEFAULT_MAX_JSONL_LINE_BYTES
+                        ),
                         on_error=str(producer_cfg.get("on_error", "skip") or "skip"),
                         max_consecutive_errors=config_int(
                             producer_cfg, "max_consecutive_errors", 20
@@ -1122,17 +1407,16 @@ async def run_producer(
                     sequence_no = source_sequence_no
                     source_sequence_no += 1
                     scanned_count += 1
-                    if sequence_no in consumed_sequence_nos:
+                    if sequence_no in consumed_sequence_nos and not producer_cfg.get(
+                        "source_route_wave_samples", 0
+                    ):
                         # Already consumed by a previous run; not a filtered row.
                         continue
                     considered_count += 1
                     # iter_input_records restarts sequence_no at zero on every
                     # pass. TQ keys require a run-global sequence number so a
                     # repeated sample never overwrites an earlier pending copy.
-                    record = replace(
-                        source_record,
-                        sequence_no=sequence_no,
-                    )
+                    record = replace(source_record, sequence_no=sequence_no)
                     try:
                         if record.response is None:
                             if on_missing_response == "skip":
@@ -1178,10 +1462,13 @@ async def run_producer(
                     yield request
                 if scanned_count == 0:
                     raise ValueError("Standalone Producer input contains no samples")
-                if produced_count == 0 and considered_count > 0 and max_samples > 0:
-                    # Only rows that were not already consumed count: an epoch
-                    # that is entirely resume-skipped must advance to the next
-                    # one instead of aborting the run.
+                if (
+                    produced_count == 0
+                    and considered_count == scanned_count
+                    and max_samples > 0
+                ):
+                    # Only a complete unskipped epoch proves every row is filtered.
+                    # Previously consumed rows may become usable in the next epoch.
                     raise ValueError(
                         "Standalone Producer filtered every newly considered "
                         f"sample (scanned={scanned_count}, "
@@ -1201,6 +1488,20 @@ async def run_producer(
                 )
 
         requests = iter(iter_requests())
+        if producer_cfg.get("source_route_wave_samples", 0):
+            from verl_speco.producer.source_routing import iter_source_route_waves
+
+            requests = iter_source_route_waves(
+                requests,
+                wave_samples=producer_cfg["source_route_wave_samples"],
+                endpoints=list(producer_cfg.get("vllm_endpoints") or []),
+                max_samples=producer_cfg.get("source_route_max_samples", 64),
+                max_tokens=producer_cfg.get("source_route_max_tokens", 1048576),
+                max_sequence_tokens=producer_cfg.get(
+                    "source_route_max_sequence_tokens", 65536
+                ),
+                consumed=consumed_sequence_nos,
+            )
         # Tokenization (and the synchronous vLLM /render calls it can make when
         # render-boundary is enabled) runs inside this generator. Advance it on a
         # worker thread so a slow render never blocks the event loop, which also
@@ -1229,10 +1530,21 @@ async def run_producer(
                 )
             return request
 
-        async def next_request_async() -> Any:
+        async def next_request_async(*, acquire_slot: bool = True) -> Any:
+            nonlocal next_admission_order
             started = time.monotonic()
             async with request_generation_lock:
                 request = await asyncio.to_thread(next_request)
+                if request is not _INPUT_DONE and deterministic_publication:
+                    order_by_sequence[int(request.sequence_no)] = next_admission_order
+                    next_admission_order += 1
+            if (
+                request is not _INPUT_DONE
+                and acquire_slot
+                and acquire_reference_slot is not None
+            ):
+                # FIFO admission prevents starving the next ordered publication.
+                await acquire_reference_slot(request)
             if request is not _INPUT_DONE:
                 timing = sample_timings[int(request.sequence_no)]
                 timing["input_dispatch"] = max(
@@ -1243,8 +1555,17 @@ async def run_producer(
         async def read_inputs() -> None:
             initial_count = 0
             while max_samples <= 0 or initial_count < max_samples:
-                request = await next_request_async()
+                if order_slots is not None:
+                    await order_slots.acquire()
+                try:
+                    request = await next_request_async()
+                except BaseException:
+                    if order_slots is not None:
+                        order_slots.release()
+                    raise
                 if request is _INPUT_DONE:
+                    if order_slots is not None:
+                        order_slots.release()
                     break
                 mark_stage("input", "input_queue_put", request.sample_id)
                 sample_timings[int(request.sequence_no)]["input_queue_started"] = (
@@ -1262,7 +1583,10 @@ async def run_producer(
         consecutive_replacements = 0
 
         async def next_replacement(
-            *, cause: BaseException | None = None
+            *,
+            cause: BaseException | None = None,
+            transfer_from: Any | None = None,
+            ordered_filtered: bool = False,
         ) -> TokenizedRequest | GenerationRequest | None:
             """Count a dropped sample and return the next replacement request.
 
@@ -1272,6 +1596,10 @@ async def run_producer(
             replacements. Returns None in unbounded mode (max_samples <= 0).
             """
             nonlocal consecutive_replacements
+            if deterministic_publication and not ordered_filtered:
+                raise RuntimeError(
+                    "Ordered publication cannot replace a failed request; restart from the last checkpoint"
+                ) from cause
             consecutive_replacements += 1
             if (
                 max_samples > 0
@@ -1288,12 +1616,21 @@ async def run_producer(
                     raise RuntimeError(message) from cause
                 raise RuntimeError(message)
             if max_samples <= 0:
+                if transfer_from is not None:
+                    assert release_unpublished_slot is not None
+                    await release_unpublished_slot(transfer_from)
                 return None
-            replacement = await next_request_async()
+            replacement = await next_request_async(acquire_slot=transfer_from is None)
             # Bounded-mode generators never terminate, so this guard is only
             # defensive; in unbounded mode we returned None above.
             if replacement is _INPUT_DONE:
+                if transfer_from is not None:
+                    assert release_unpublished_slot is not None
+                    await release_unpublished_slot(transfer_from)
                 return None
+            if transfer_from is not None:
+                assert transfer_unpublished_slot is not None
+                await transfer_unpublished_slot(transfer_from, replacement)
             logger.info(
                 "Standalone Producer requesting replacement sample "
                 "sequence_no=%s sample_id=%s",
@@ -1385,22 +1722,37 @@ async def run_producer(
                     generate_started = time.monotonic()
                     try:
                         generated = await (
-                            pool.generate_reference(request)
+                            _finish_reference_io(
+                                pool.generate_reference(request),
+                                discard=discard_reference,
+                                should_drain=should_drain,
+                            )
                             if hidden_references
                             else pool.generate(request)
                         )
                     except Exception as exc:  # noqa: BLE001 - keep the producer alive
                         timing["generate"] = time.monotonic() - generate_started
                         account_request_failure(request, exc, stage="generate")
+                        if acquire_reference_slot is not None:
+                            raise RuntimeError(
+                                "Reference generation failed; execution slot retained"
+                            ) from exc
                         replacement_request = await next_replacement(cause=exc)
                         continue
                     timing["generate"] = time.monotonic() - generate_started
+                    generated_deleted = False
                     try:
                         try:
+                            generation_request = request
                             request = prepare_generated_prefill_request(
                                 request,
                                 generated.generated_token_ids,
                                 producer_cfg,
+                            )
+                            request = replace(
+                                request,
+                                source_route=generation_request.source_route,
+                                source_plan_sha256=generation_request.source_plan_sha256,
                             )
                         except SampleFilteredError as exc:
                             stats.filtered_count += 1
@@ -1413,24 +1765,66 @@ async def run_producer(
                                 stats.filtered_count,
                                 exc,
                             )
-                            replacement_request = await next_replacement(cause=exc)
+                            if (
+                                acquire_reference_slot is not None
+                                or deterministic_publication
+                            ):
+                                await asyncio.to_thread(
+                                    retry_io,
+                                    partial(delete_temporary_result, generated),
+                                    name="Filtered generated reference cleanup",
+                                    retry_if=lambda error: True,
+                                )
+                                generated_deleted = True
+                            if deterministic_publication:
+                                # A replacement inherits the filtered request's order slot.
+                                await publish_queue.put(
+                                    _SkippedReference(
+                                        int(request.sequence_no),
+                                        release_slot=max_samples <= 0,
+                                    )
+                                )
+                            replacement_request = await next_replacement(
+                                cause=exc,
+                                transfer_from=request
+                                if acquire_reference_slot is not None
+                                else None,
+                                ordered_filtered=deterministic_publication,
+                            )
                             continue
                     finally:
                         # The generation request may still produce a prompt-only
                         # connector file. It is not the training payload; the
                         # following full-sequence prefill produces that payload.
-                        await _delete_result_best_effort(generated)
+                        if not generated_deleted:
+                            if acquire_reference_slot is not None:
+                                # Reusing a slot while its generation payload remains
+                                # allocated would invalidate the admission bound.
+                                await _finish_reference_io(
+                                    discard_reference(generated),
+                                    should_drain=should_drain,
+                                )
+                            else:
+                                await _delete_result_best_effort(generated)
                 mark_stage(worker, "vllm_prefill", request.sample_id)
                 prefill_started = time.monotonic()
                 try:
                     raw = await (
-                        pool.prefill_reference(request)
+                        _finish_reference_io(
+                            pool.prefill_reference(request),
+                            discard=discard_reference,
+                            should_drain=should_drain,
+                        )
                         if hidden_references
                         else pool.prefill(request)
                     )
                 except Exception as exc:  # noqa: BLE001 - keep the producer alive
                     timing["prefill"] = time.monotonic() - prefill_started
                     account_request_failure(request, exc, stage="prefill")
+                    if acquire_reference_slot is not None:
+                        raise RuntimeError(
+                            "Reference prefill failed; execution slot retained"
+                        ) from exc
                     replacement_request = await next_replacement(cause=exc)
                     continue
                 reference_ready_at = time.monotonic()
@@ -1690,12 +2084,12 @@ async def run_producer(
                     if ending:
                         stages.pop(worker, None)
                         return
-                    first = await publish_queue.get()
+                    first = await ordered_publish_queue.get()
                     if first is _PUBLISH_DONE:
                         stages.pop(worker, None)
                         return
                     batch, ending = await _collect_reference_batch(
-                        publish_queue,
+                        ordered_publish_queue,
                         first,
                         reference_batch_size,
                         on_dequeue=lambda item: item.timing.update(
@@ -1740,12 +2134,41 @@ async def run_producer(
                     mark_stage(worker, "metadata_submit", first.request.sample_id)
                     publish_inflight += 1
                     peak_publish_inflight = max(peak_publish_inflight, publish_inflight)
-                    try:
-                        publication = await on_references(entries)
-                        for item in buffered:
-                            unsubmitted_references.pop(
-                                _as_vllm_reference(item.raw).reference, None
+
+                    async def submit_references():
+                        unpublished = set()
+                        try:
+                            result = await on_references(entries)
+                            unpublished.update(
+                                (result or {}).get("unsubmitted_keys", ())
                             )
+                            return result
+                        finally:
+                            # Unknown delivery belongs to the Driver. Keep only
+                            # explicitly rejected payloads for local cleanup.
+                            for item, entry in zip(buffered, entries, strict=True):
+                                if entry["key"] not in unpublished:
+                                    unsubmitted_references.pop(
+                                        _as_vllm_reference(item.raw).reference, None
+                                    )
+
+                    try:
+                        publication = await _finish_reference_io(
+                            submit_references(), should_drain=should_drain
+                        )
+                        if publication and publication.get("unsubmitted_keys"):
+                            return
+                        for item in buffered:
+                            if order_slots is not None:
+                                del order_by_sequence[int(item.request.sequence_no)]
+                                order_slots.release()
+                    except BaseException:
+                        logger.warning(
+                            "Preserving %s references after uncertain metadata delivery; "
+                            "reclaim only after remote readers are fenced",
+                            len(entries),
+                        )
+                        raise
                     finally:
                         publish_inflight -= 1
                     published_at = time.monotonic()
@@ -1957,16 +2380,18 @@ async def run_producer(
             for task in [*tasks, *request_tasks]:
                 if not task.done():
                     task.cancel()
-            await asyncio.gather(*tasks, *request_tasks, return_exceptions=True)
+            outcomes = await asyncio.gather(
+                *tasks, *request_tasks, return_exceptions=True
+            )
+            cleanup_error = next(
+                (item for item in outcomes if isinstance(item, Exception)), None
+            )
             for raw in unsubmitted_references.values():
                 try:
-                    await asyncio.to_thread(
-                        retry_io,
-                        partial(delete_temporary_result, raw),
-                        name="Unsubmitted hidden reference cleanup",
-                        retry_if=lambda exc: True,
-                    )
-                except Exception:
+                    await discard_reference(raw)
+                except Exception as error:
+                    if cleanup_error is None:
+                        cleanup_error = error
                     logger.exception(
                         "Failed to release unsubmitted hidden reference %s",
                         raw.reference,
@@ -1978,6 +2403,8 @@ async def run_producer(
             heartbeat.cancel()
             loop_monitor.cancel()
             await asyncio.gather(heartbeat, loop_monitor, return_exceptions=True)
+            if cleanup_error is not None and acquire_reference_slot is not None:
+                raise cleanup_error
 
         if stats.published_count == 0:
             logger.error(
@@ -2144,7 +2571,14 @@ def _reference_tag(request, response, contract, run_id, tq_cfg):
     values["dtype"] = str(contract.dtype)
     return make_reference_tag(
         _sample_metadata(request, None, contract, run_id, tq_cfg),
-        backend="mooncake" if response.is_handle else "file",
+        backend=(
+            "native"
+            if response.is_handle
+            and getattr(getattr(response, "store", None), "backend", None) == "native"
+            else "mooncake"
+            if response.is_handle
+            else "file"
+        ),
         path=response.hidden_states_path,
         handle=response.handle,
         transfer_params=response.transfer_params,

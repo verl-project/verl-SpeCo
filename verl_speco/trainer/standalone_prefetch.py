@@ -7,7 +7,7 @@ from __future__ import annotations
 import threading
 import time
 from collections import deque
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, wait
 from dataclasses import replace
 from functools import partial
 from typing import Any
@@ -15,7 +15,69 @@ from typing import Any
 import torch
 import torch.distributed as dist
 
+from verl_speco.config import validate_timeout
 from verl_speco.trainer.standalone_data import StandaloneLocalBatch
+
+
+def _prepared_host_bytes(batch):
+    """Bound original tensor storages plus the copies made by the pin thread."""
+    storages, pin_bytes = {}, 0
+    for value in batch.values():
+        if torch.is_tensor(value):
+            storage = value.untyped_storage()
+            storages[storage._cdata] = storage.nbytes()
+            pin_bytes += max(storage.nbytes(), value.numel() * value.element_size())
+    return sum(storages.values()) + pin_bytes
+
+
+def _reference_device_transfer_bytes(batch):
+    """Conservatively account every tensor copied by the device staging path."""
+    return sum(
+        max(value.untyped_storage().nbytes(), value.numel() * value.element_size())
+        for value in batch.values()
+        if torch.is_tensor(value)
+    )
+
+
+def _host_budget_depth(depth, max_host_bytes, max_batch_host_bytes):
+    if (
+        type(max_host_bytes) is not int
+        or max_host_bytes < 0
+        or type(max_batch_host_bytes) is not int
+        or max_batch_host_bytes < 0
+        or bool(max_host_bytes) != bool(max_batch_host_bytes)
+    ):
+        raise ValueError(
+            "Prefetch host byte limits must both be non-negative integers and enabled together"
+        )
+    if max_host_bytes:
+        if max_host_bytes < max_batch_host_bytes:
+            raise ValueError("Prefetch host bytes must cover one maximum-sized batch")
+        depth = min(depth, max_host_bytes // max_batch_host_bytes)
+    return depth
+
+
+class _TrackedPrefetchExecutor(ThreadPoolExecutor):
+    """Keep in-flight reads visible after the coordinator has stopped."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._tracked, self._tracked_lock = set(), threading.Lock()
+
+    def submit(self, *args, **kwargs):
+        future = super().submit(*args, **kwargs)
+        with self._tracked_lock:
+            self._tracked.add(future)
+        future.add_done_callback(self._forget)
+        return future
+
+    def _forget(self, future):
+        with self._tracked_lock:
+            self._tracked.discard(future)
+
+    def pending(self):
+        with self._tracked_lock:
+            return {future for future in self._tracked if not future.done()}
 
 
 class StandalonePrefetchIterator:
@@ -35,15 +97,26 @@ class StandalonePrefetchIterator:
         pin_memory: bool = False,
         prepare_workers: int = 4,
         pin_device: torch.device | None = None,
+        max_host_bytes: int = 0,
+        max_batch_host_bytes: int = 0,
     ):
+        depth = _host_budget_depth(depth, max_host_bytes, max_batch_host_bytes)
+        if max_host_bytes and (
+            not pin_memory or getattr(loader, "cleanup_after_load", False)
+        ):
+            raise ValueError(
+                "Prefetch host limits require deferred-cleanup reference batches"
+            )
         if depth < 1:
             raise ValueError("prefetch depth must be positive")
         if prepare_workers < 0:
             raise ValueError("prepare_workers must be non-negative")
+        validate_timeout(close_timeout, "Prefetch close timeout")
         if pin_memory and getattr(loader, "prepare_batch", None) is None:
             raise ValueError("Independent pinning requires file batch preparation")
         self.loader = loader
         self.depth = depth
+        self._max_batch_host_bytes = max_batch_host_bytes
         self.close_timeout = close_timeout
         self.stop = loader.stop_event = threading.Event()
         self._condition = threading.Condition()
@@ -53,13 +126,13 @@ class StandalonePrefetchIterator:
         self._source_done = False
         self._pin_device = pin_device
         self._original_prepare: Any | None = None
-        self._executor: ThreadPoolExecutor | None = None
+        self._executor: _TrackedPrefetchExecutor | None = None
         self._pin_thread: threading.Thread | None = None
         if pin_memory:
             assert loader.prepare_batch is not None
             self._original_prepare = loader.prepare_batch
             if prepare_workers:
-                self._executor = ThreadPoolExecutor(
+                self._executor = _TrackedPrefetchExecutor(
                     max_workers=prepare_workers,
                     thread_name_prefix=f"file-prepare-{loader.rank}",
                 )
@@ -97,9 +170,22 @@ class StandalonePrefetchIterator:
             return state.tolist()
         return values
 
-    def _run(self) -> None:
-        source = iter(self.loader)
+    def _open_source(self, factory):
+        source, error = None, None
         try:
+            source = factory()
+        except BaseException as exc:
+            error = exc
+        if self._sync([int(error is not None)])[0]:
+            raise RuntimeError(
+                "Consumer prefetch source initialization failed on at least one rank"
+            ) from error
+        return source
+
+    def _run(self) -> None:
+        source = None
+        try:
+            source = self._open_source(lambda: iter(self.loader))
             while True:
                 with self._condition:
                     self._condition.wait_for(
@@ -114,6 +200,18 @@ class StandalonePrefetchIterator:
                 exhausted = False
                 try:
                     batch = next(source)
+                    if self._max_batch_host_bytes:
+                        if batch.prepared_batch is None:
+                            raise RuntimeError(
+                                "Reference prefetch returned no prepared batch"
+                            )
+                        if (
+                            _prepared_host_bytes(batch.prepared_batch)
+                            > self._max_batch_host_bytes
+                        ):
+                            raise ValueError(
+                                "Prepared reference batch exceeds consumer_prefetch_batch_bytes"
+                            )
                 except StopIteration:
                     exhausted = True
                 except BaseException as exc:  # noqa: BLE001 - deliver thread failures to every rank
@@ -166,9 +264,9 @@ class StandalonePrefetchIterator:
             while True:
                 with self._condition:
                     self._condition.wait_for(
-                        lambda: (
-                            self.stop.is_set() or self._pin_batches or self._source_done
-                        )
+                        lambda: self.stop.is_set()
+                        or self._pin_batches
+                        or self._source_done
                     )
                     if self.stop.is_set() or not self._pin_batches:
                         return
@@ -230,23 +328,40 @@ class StandalonePrefetchIterator:
                 raise self._error
             raise StopIteration
 
-    def close(self) -> None:
+    def _thread_work_running(self) -> bool:
+        return (
+            self._thread.is_alive()
+            or (self._pin_thread is not None and self._pin_thread.is_alive())
+            or (self._executor is not None and bool(self._executor.pending()))
+        )
+
+    @property
+    def has_running_work(self) -> bool:
+        return self._thread_work_running()
+
+    def _begin_close(self, timeout: float | None) -> float:
+        timeout = self.close_timeout if timeout is None else timeout
+        validate_timeout(timeout, "Prefetch close timeout")
+        deadline = time.monotonic() + timeout
         self.stop.set()
         with self._condition:
             self._condition.notify_all()
-        self._thread.join(timeout=self.close_timeout)
-        if self._thread.is_alive():
-            raise RuntimeError(
-                "Consumer prefetch thread did not stop before its shutdown deadline"
-            )
+        return deadline
+
+    def close(self, *, timeout: float | None = None) -> None:
+        deadline = self._begin_close(timeout)
+        self._thread.join(timeout=max(0.0, deadline - time.monotonic()))
         if self._pin_thread is not None:
-            self._pin_thread.join(timeout=self.close_timeout)
-            if self._pin_thread.is_alive():
-                raise RuntimeError(
-                    "Consumer pin thread did not stop before its shutdown deadline"
-                )
+            self._pin_thread.join(timeout=max(0.0, deadline - time.monotonic()))
         if self._executor is not None:
-            self._executor.shutdown(wait=True, cancel_futures=True)
+            self._executor.shutdown(wait=False, cancel_futures=True)
+            wait(
+                self._executor.pending(), timeout=max(0.0, deadline - time.monotonic())
+            )
+        if self._thread_work_running():
+            raise RuntimeError(
+                "TQ prefetch work did not stop before its shutdown deadline"
+            )
         if self._original_prepare is not None:
             self.loader.prepare_batch = self._original_prepare
         self._batches.clear()

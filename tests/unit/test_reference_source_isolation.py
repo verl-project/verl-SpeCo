@@ -49,7 +49,7 @@ store = build_feature_store_from_config(
 store.connect()
 assert store.owner_ready()
 assert type(store).__bases__ == (object,)
-assert ReferenceFeatureDataLoader.__bases__ == (object,)
+assert ReferenceFeatureDataLoader.__bases__[0].__module__ == "verl_speco.trainer.reference_sample_source"
 assert ReferenceBatchPrefetchIterator.__bases__ == (StandalonePrefetchIterator,)
 store.close()
 assert not blocked.intersection(sys.modules)
@@ -111,7 +111,9 @@ def test_reference_loader_ignores_duplicate_plans_without_repreparing():
 def test_reference_assignments_are_metadata_only_and_rank_local():
     commands = Queue()
     command = _command(1)
-    command["assignments"].append([{"key": "other-rank", "tag": {}}])
+    command["assignments"].append([{"key": "other-rank", "tag": {"sequence_no": 2}}])
+    command["global_keys"].append("other-rank")
+    command["global_sequence_nos"].append(2)
     commands.put(command)
     commands.put({"kind": "stop"})
     loader = _loader(

@@ -242,7 +242,7 @@ result = "init_failed"
 try:
     dist.init_process_group(
         backend="gloo",
-        init_method="file://" + init_file,
+        init_method=init_file,
         rank=rank,
         world_size=world_size,
         timeout=timedelta(seconds=30),
@@ -287,7 +287,10 @@ def _run_gloo_resume_case(tmp_path: Path, mode: str) -> dict[str, str]:
 
     script = tmp_path / "gloo_resume_driver.py"
     script.write_text(textwrap.dedent(_GLOO_RESUME_DRIVER).lstrip(), encoding="utf-8")
-    init_file = tmp_path / "gloo_init"
+    import socket
+    with socket.socket() as rendezvous:
+        rendezvous.bind(("127.0.0.1", 0))
+        init_file = f"tcp://127.0.0.1:{rendezvous.getsockname()[1]}"
     result_dir = tmp_path / "results"
     result_dir.mkdir()
     repo_root = Path(__file__).resolve().parents[2]

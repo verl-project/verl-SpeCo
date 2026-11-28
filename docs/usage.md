@@ -1,6 +1,6 @@
 # verl-SpeCo Usage Guide
 
-Last updated: 11/19/2026
+Last updated: 11/27/2026
 
 Use the version and runtime guidance below to install SpeCo and run online co-training or standalone drafter training. For the project overview and architecture, see the [README](../README.md).
 
@@ -410,8 +410,14 @@ supervised response. Text such as `<tool_call>...</tool_call>` is preserved.
 The tools schema is passed to the target tokenizer's chat template and, when
 enabled, to the server-side `/render` boundary calls. Rows without `tools`
 retain the existing rendering behavior. Both sequential and shuffled reading
-support JSON arrays; arrays are loaded in memory, so JSONL is preferable for
-large datasets. Non-Parquet files with other extensions, including files without
+support JSON arrays, including UTF-8 BOM files. `speco.standalone_tq_producer.max_json_array_bytes` optionally bounds the encoded
+file size before parsing in both reading modes. It defaults to `0` (unlimited);
+set `67108864` for a 64 MiB limit. Parsed Python objects
+consume more memory than the encoded file. `max_indexed_records` additionally
+limits shuffled array records after parsing; `max_jsonl_line_bytes` applies only
+to JSONL. Convert larger datasets to JSONL or Parquet. `tools` requires a
+chat-message prompt; string prompts with `tools` are rejected. Non-Parquet files
+with other extensions, including files without
 an extension, retain line-by-line JSONL parsing and its per-record error policy.
 
 Streaming standalone training runs the Producer as a Ray actor and the Consumer
@@ -706,6 +712,37 @@ hash `metadata.json` and `manifest.jsonl`. Resume skips consumed occurrences and
 rejects changed indexes or shuffle settings. Treat the dataset as immutable during
 training; tensor files themselves are not content-hashed by this cursor. Supply an
 existing drafter checkpoint through the usual drafter `model_path` to resume.
+
+Content-verified model caches (`drafter.training.target_model_cache_content_identity=true`)
+must be expanded local directories without symlinks. Standard HuggingFace
+`snapshots/<revision>` trees link files into `blobs`; first copy the snapshot to a
+separate local directory with `cp -rL <snapshot> <expanded-model>` and use that
+directory as the target model path. Saved-hidden `metadata.json` and
+`manifest.jsonl` must also be regular files without symlinks.
+
+`speco.standalone_tq_producer.reference_lease_journal_path` is optional. On POSIX
+it requires Linux with `/proc/self/fd` mounted. Put the SQLite file in an absolute,
+symlink-free directory owned by the training user with exactly mode `0700`.
+With the target vLLM service already running, create or secure a dedicated private
+directory. Set `SPECO_VLLM_ENDPOINTS` to that service's actual host and port, and
+pass the complete SQLite path together with reference credits and rank acknowledgements:
+
+```bash
+mkdir -p /tmp/speco-leases
+chmod 700 /tmp/speco-leases
+SPECO_VLLM_ENDPOINTS='[http://<host>:<port>/v1]' \
+  MODEL_PATH=/path/to/Qwen3-8B \
+  TRAIN_FILE=/path/to/train.jsonl \
+  DRAFT_CKPTS_DIR=/path/to/dspark-checkpoints \
+  bash examples/run_qwen3-8b_drafter_dspark_separate_training.sh \
+    speco.standalone_tq_producer.reference_lease_journal_path=/tmp/speco-leases/leases.sqlite \
+    speco.standalone_tq_producer.max_published_references=1024 \
+    speco.draft_training.scheduler.per_rank_reference_ack=true
+```
+
+Directly using `/tmp/leases.sqlite` or a group-readable shared job directory is
+rejected. Create a private subdirectory instead of changing permissions on a shared directory.
+Keep unresolved journals for fencing/reconciliation before reusing their paths.
 
 ## Configuration
 

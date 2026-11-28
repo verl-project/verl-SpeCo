@@ -25,6 +25,7 @@ class StandaloneDrafterWorker(Worker):
         config: Any,
         scheduled_commands: Any | None = None,
         training_events: Any | None = None,
+        producer_handle: Any | None = None,
     ):
         # draft_train.main() used to configure the root logger. This worker
         # enters the training loop directly, so restore the same INFO level
@@ -43,6 +44,7 @@ class StandaloneDrafterWorker(Worker):
         self.config = config
         self.scheduled_commands = scheduled_commands
         self.training_events = training_events
+        self.producer_handle = producer_handle
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL, blocking=False)
     async def run_standalone_training(self):
@@ -54,6 +56,7 @@ class StandaloneDrafterWorker(Worker):
             self.config,
             scheduled_commands=self.scheduled_commands,
             training_events=self.training_events,
+            producer_handle=self.producer_handle,
         )
 
 

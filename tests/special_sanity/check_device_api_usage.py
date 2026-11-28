@@ -51,6 +51,8 @@ CUDA_KEYWORD_CHECK_WHITELIST = [
     # and non-CUDA backends; no tensor placement/device allocation occurs here.
     "verl_speco/models/dflash/flex_attention.py",
     "verl_speco/trainer/base_trainer.py",
+    # Maps pinned Ray worker resources to the upstream worker device type.
+    "verl_speco/standalone_ray_runtime.py",
     "verl_speco/trainer/draft_training_loop.py",
     # The V1 adapter passes the configured runtime device through to upstream
     # V1 Ray workers and is therefore an explicit verl runtime boundary.

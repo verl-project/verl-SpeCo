@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import pytest
+from standalone_test_utils import NativeCopyTestEngine, NativeTestEngine
 import torch
 
 from verl_speco.producer.hidden_states_store import (
@@ -55,6 +56,81 @@ def test_build_store_defaults_to_file() -> None:
 def test_build_store_selects_mooncake() -> None:
     store = build_hidden_states_store({"backend": "mooncake"})
     assert isinstance(store, MooncakeHiddenStatesStore)
+    settings = MooncakeStoreSettings(local_hostname="127.0.0.1")
+    assert HiddenStatesStoreConfig("mooncake", settings).mooncake is settings
+
+
+def test_managed_native_reader_keeps_source_until_scheduler_release():
+    import json
+    from verl_speco.producer.hidden_states_store import build_managed_native_reader
+    from verl_speco.trainer.feature_store import build_feature_store_from_config
+    from verl_speco.transport.native_feature_transport import NativeFeatureTransport
+
+
+    settings = {"endpoints": ["localhost:1001", "localhost:1002"], "generation": 1,
+                "metadata_server": "metadata", "max_bytes": 4 * 1024**2, "chunk_bytes": 2 * 1024**2}
+    for bad in ({**settings, "endpoints": ["same", "same"]}, {**settings, "endpoints": ["only-one"]},
+                {**settings, "unexpected": 1}):
+        with pytest.raises(ValueError, match="Native reader"):
+            build_managed_native_reader(bad, run_id="run", rank=0, world_size=2, device="cpu", engine_factory=NativeCopyTestEngine)
+    reader = build_managed_native_reader(settings, run_id="run", rank=1, world_size=2, device="cpu", engine_factory=NativeCopyTestEngine)
+    source = NativeFeatureTransport(run_id="run", generation=1, endpoint="source", metadata_server="metadata",
+                                    device="cpu", max_bytes=4 * 1024**2, max_slots=1,
+                                    chunk_bytes=2 * 1024**2, engine_factory=NativeCopyTestEngine)
+    descriptor = source.publish({"ids": torch.arange(4)}, lease_id="sample")
+    binding = {"plan_id": 0, "receipt_token": "receipt"}
+    source.bind_readers(descriptor, readers=[1], **binding)
+    handle = json.dumps(descriptor)
+    assert torch.equal(reader.load(handle)[0]["ids"], torch.arange(4))
+    reader.release(handle)
+    assert "sample" in source._slots
+    with pytest.raises(ValueError, match="requires ray_reference"):
+        build_feature_store_from_config({"type": "torch_shard"}, hidden_states_store=reader)
+    store = build_feature_store_from_config({"type": "ray_reference"}, read_only=True,
+                                            transfer_queue_cfg={"run_id": "run", "ray": {"address": "unused"}},
+                                            hidden_states_store=reader)
+    assert store.hidden_states_store is reader
+    store.close_local()
+    source.acknowledge(descriptor, reader=1, **binding)
+    source.release(descriptor, **binding)
+    source.close()
+
+
+def test_shared_file_root_limits_reads_and_cleanup(tmp_path):
+    from safetensors.torch import save_file
+    root = tmp_path / "shared"
+    root.mkdir()
+    inside, outside = root / "inside.safetensors", tmp_path / "outside.safetensors"
+    for path in (inside, outside):
+        save_file({"token_ids": torch.arange(2), "hidden_states": torch.ones(2, 1, 2)}, str(path))
+    store = build_hidden_states_store({"backend": "file", "file_root": str(root)})
+    assert store.load(str(inside))[0]["token_ids"].tolist() == [0, 1]
+    with pytest.raises(ValueError, match="outside the configured shared file root"):
+        store.load(str(outside))
+    with pytest.raises(ValueError, match="outside the configured shared file root"):
+        store.release(str(outside))
+    assert outside.exists()
+    store.release(str(inside))
+    assert not inside.exists()
+
+
+def test_shared_file_root_requires_absolute_existing_file_backend(tmp_path):
+    with pytest.raises(ValueError, match="absolute"):
+        HiddenStatesStoreConfig.from_mapping({"file_root": "relative/path"})
+    with pytest.raises(ValueError, match="file backend"):
+        HiddenStatesStoreConfig.from_mapping({"backend": "mooncake", "file_root": str(tmp_path)})
+    with pytest.raises(ValueError, match="existing absolute"):
+        build_hidden_states_store({"file_root": str(tmp_path / "missing")})
+
+
+def test_shared_file_store_rejects_replaced_root(tmp_path):
+    root = tmp_path / "shared"
+    root.mkdir()
+    store = FileHiddenStatesStore(str(root))
+    root.rename(tmp_path / "previous")
+    root.mkdir()
+    with pytest.raises(ValueError, match="shared file root changed"):
+        store.validate_reference(str(root / "sample.safetensors"))
 
 
 def test_config_rejects_unknown_backend() -> None:
@@ -114,6 +190,146 @@ def test_mooncake_store_release_propagates_deletion_failure() -> None:
     # Deletion errors must surface so callers with a retry policy can react.
     with pytest.raises(RuntimeError, match="gone"):
         store.release("missing")
+
+
+def _native_connector_for_test(upstream, device):
+    import ast
+    import os
+    import threading
+    import uuid
+    from pathlib import Path
+    path = Path(__file__).resolve().parents[2] / "verl_speco/mooncake_hidden_states_connector.py"
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    cls = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "SpecoNativeHiddenStatesConnector")
+    module = ast.Module(body=[ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0), cls],
+                        type_ignores=[])
+    namespace = {"SpecoMooncakeHiddenStatesConnector": object, "torch": torch, "threading": threading,
+                 "uuid": uuid, "os": os, "_upstream_hs": upstream, "get_torch_device": lambda: device}
+    exec(compile(ast.fix_missing_locations(module), str(path), "exec"), namespace)
+    return namespace["SpecoNativeHiddenStatesConnector"]
+
+
+@pytest.mark.parametrize("publish_fails", [False, True])
+def test_native_connector_captures_device_payload_and_preserves_ambiguous_source(monkeypatch, publish_fails):
+    import sys
+    from contextlib import nullcontext
+    from types import SimpleNamespace
+    from verl_speco.transport.native_feature_transport import NativeFeatureTransport
+    events, published = [], []
+    class Stream:
+        def wait_event(self, value): events.append(("wait", value))
+        def synchronize(self): events.append(("synchronize", None))
+    def extract(cache, slots, count):
+        assert slots.tolist() == [8, 9, 10, 11, 16, 17, 18, 19] and count == 3
+        return cache[:3]
+    upstream = SimpleNamespace(extract_from_kv_cache=extract, assert_finite=lambda *args: None)
+    cls = _native_connector_for_test(upstream, SimpleNamespace(stream=lambda _: nullcontext()))
+    connector = cls()
+    connector._kv_cache = torch.arange(6, dtype=torch.float32).reshape(3, 1, 2)
+    connector._copy_stream, connector._block_size = Stream(), 4
+    connector._native_source = NativeFeatureTransport(run_id="run", generation=1, endpoint="source",
+        metadata_server="metadata", device="cpu", max_bytes=4 * 1024**2, max_slots=1,
+        chunk_bytes=2 * 1024**2, engine_factory=NativeTestEngine)
+    def publish(handle, descriptor):
+        published.append((handle, descriptor))
+        if publish_fails:
+            raise TimeoutError("ambiguous publish")
+    connector._native_directory = SimpleNamespace(publish=SimpleNamespace(remote=publish))
+    connector._native_control_timeout = 1.0
+    connector._native_ready = True
+    monkeypatch.setitem(sys.modules, "ray", SimpleNamespace(get=lambda result, timeout: result))
+    pending = SimpleNamespace(block_ids=[2, 4], token_ids=torch.tensor([10, 11, 12]), mooncake_key="sample")
+    if publish_fails:
+        with pytest.raises(TimeoutError, match="ambiguous"):
+            connector._publish_sample(pending, "ready")
+    else:
+        connector._publish_sample(pending, "ready")
+    assert events == [("wait", "ready"), ("synchronize", None)]
+    assert published[0][0] == "sample" and "sample" in connector._native_source._slots
+    connector._native_source.discard_unbound(published[0][1])
+    connector._native_source.close()
+
+
+@pytest.mark.parametrize("registration_fails", [False, True])
+def test_native_connector_registers_source_and_retains_ambiguous_setup(monkeypatch, registration_fails):
+    import sys
+    import threading
+    import types
+    from queue import Queue
+    from types import SimpleNamespace
+    from verl_speco.transport import native_feature_transport as native
+    ready_queues = set()
+
+    class ControlQueue(Queue):
+        def __init__(self, maxsize):
+            super().__init__(maxsize)
+            self.actor = SimpleNamespace(qsize=SimpleNamespace(remote=lambda: self))
+
+    def ray_get(value, timeout):
+        if isinstance(value, list):
+            ready_queues.update(value)
+            return [queue.qsize() for queue in value]
+        return value
+
+    registrations, errors = [], []
+    entered, proceed, second_done = threading.Event(), threading.Event(), threading.Event()
+    def register(endpoint, source_id, options, source_settings):
+        assert ready_queues == {options["request_queue"], options["response_queue"]}
+        registrations.append((endpoint, source_id, options, source_settings))
+        entered.set()
+        assert proceed.wait(3)
+        if registration_fails:
+            raise TimeoutError("registration reply lost")
+    directory = SimpleNamespace(scope=SimpleNamespace(remote=lambda: {"run_id": "run", "generation": 1}),
+                                register_source=SimpleNamespace(remote=register))
+    ray = types.ModuleType("ray")
+    ray.__path__ = []
+    ray.is_initialized = lambda: True
+    ray.get_runtime_context = lambda: SimpleNamespace(gcs_address="ray:6379")
+    ray.get_actor = lambda name, namespace: directory
+    ray.get = ray_get
+    ray_util, ray_queue = types.ModuleType("ray.util"), types.ModuleType("ray.util.queue")
+    ray_util.__path__, ray_queue.Queue = [], ControlQueue
+    monkeypatch.setitem(sys.modules, "ray", ray)
+    monkeypatch.setitem(sys.modules, "ray.util", ray_util)
+    monkeypatch.setitem(sys.modules, "ray.util.queue", ray_queue)
+    monkeypatch.setattr(native, "NativeFeatureTransport", lambda **kwargs: SimpleNamespace(settings=kwargs, endpoint="source:actual"))
+    monkeypatch.setattr(native, "NativeSourceControlService", lambda source, **kwargs: SimpleNamespace(source=source))
+    for name, value in {"SPECO_NATIVE_DIRECTORY": "dir", "SPECO_NATIVE_RUN_ID": "run",
+                        "SPECO_NATIVE_GENERATION": "1", "SPECO_NATIVE_SOURCE_ENDPOINT": "source",
+                        "SPECO_NATIVE_METADATA_SERVER": "metadata", "SPECO_NATIVE_SOURCE_MAX_BYTES": "4194304",
+                        "SPECO_NATIVE_SOURCE_MAX_SLOTS": "1", "SPECO_NATIVE_CHUNK_BYTES": "2097152"}.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.setenv("SPECO_NATIVE_RAY_ADDRESS", "ray:6379")
+    connector = _native_connector_for_test(None, None)()
+    connector._kv_cache = torch.zeros(1)
+    def initialize(done=None):
+        try:
+            connector._ensure_store()
+        except BaseException as exc:
+            errors.append(exc)
+        finally:
+            if done is not None:
+                done.set()
+    first = threading.Thread(target=initialize)
+    second = threading.Thread(target=initialize, args=(second_done,))
+    first.start()
+    assert entered.wait(3)
+    second.start()
+    assert not second_done.wait(0.05)
+    proceed.set()
+    first.join(timeout=3)
+    second.join(timeout=3)
+    assert not first.is_alive() and not second.is_alive()
+    if registration_fails:
+        assert {type(error) for error in errors} == {TimeoutError, RuntimeError}
+        assert connector._native_init_failed and not connector._native_ready
+    else:
+        assert not errors and connector._native_ready
+        connector._ensure_store()
+    assert len(registrations) == 1 and connector._native_source is connector._native_service.source
+    assert registrations[0][0] == "source:actual" and len(registrations[0][1]) == 32
+    assert connector._native_source.settings["device"] == torch.device("cpu")
 
 
 def test_connector_register_kv_caches_uses_device_stream(monkeypatch) -> None:
@@ -282,3 +498,121 @@ class _RecordingPublishStore:
 
     def put_error(self, transfer_manifest, error):
         self.errors.append((transfer_manifest, error))
+
+
+@pytest.mark.parametrize("operation", ["read", "unlink"])
+def test_regular_file_rejects_symlink_and_preserves_target(tmp_path, operation):
+    from verl_speco.regular_file import regular_file, unlink_regular
+    target, link = tmp_path / "target", tmp_path / "link"
+    target.write_bytes(b"keep")
+    try:
+        link.symlink_to(target)
+    except OSError:
+        pytest.skip("Symlinks unavailable")
+    with pytest.raises((OSError, ValueError)):
+        if operation == "read":
+            with regular_file(link) as stream:
+                stream.read()
+        else:
+            unlink_regular(link)
+    assert target.read_bytes() == b"keep"
+
+
+@pytest.mark.parametrize("matching_identity", [False, True])
+def test_regular_file_requires_root_identity_even_when_path_spellings_differ(tmp_path, matching_identity):
+    from verl_speco.regular_file import regular_file
+    recorded_root, accessed_root = tmp_path / "recorded", tmp_path / "accessed"
+    recorded_root.mkdir()
+    accessed_root.mkdir()
+    reference = accessed_root / "sample"
+    reference.write_bytes(b"original")
+    # Model an alias by supplying the accessed directory's identity with a
+    # different recorded spelling. A mismatching identity must never be skipped.
+    info = (accessed_root if matching_identity else recorded_root).stat()
+    def read():
+        with regular_file(reference, root=recorded_root, identity=(info.st_dev, info.st_ino)) as stream:
+            return stream.read()
+    if matching_identity:
+        assert read() == b"original"
+    else:
+        with pytest.raises(ValueError, match="shared file root changed"):
+            read()
+
+
+@pytest.mark.parametrize("operation", ["load", "hidden_shape", "load_window", "scan_bad_auxiliary_rows", "tensor_bytes", "lock"])
+def test_shared_root_replacement_between_validation_and_open_is_rejected(tmp_path, monkeypatch, operation):
+    from pathlib import Path
+    root = tmp_path / "shared"
+    root.mkdir()
+    reference = root / "sample"
+    reference.write_bytes(b"original")
+    store = FileHiddenStatesStore(str(root), wait_for_writer=False)
+    validate = store.validate_reference
+    def replace_root(value):
+        path = validate(value)
+        root.rename(tmp_path / "original-root")
+        root.mkdir()
+        reference.write_bytes(b"replacement")
+        if operation == "lock":
+            Path(f"{reference}.lock").touch()
+        return path
+    monkeypatch.setattr(store, "validate_reference", replace_root)
+    with pytest.raises(ValueError, match="shared file root changed"):
+        if operation == "load_window":
+            store.load_window(str(reference), all_positions=[0], selected_positions=[0], prompt_length=1)
+        elif operation == "scan_bad_auxiliary_rows":
+            store.scan_bad_auxiliary_rows(str(reference), all_positions=[0], selected_positions=[0],
+                prompt_ids=[1], auxiliary_layers=1, required_layers=1, feature_dtype=torch.bfloat16, clip_value=None)
+        elif operation == "lock":
+            from verl_speco.producer.hidden_states_store import _wait_for_lock
+            store.validate_reference(str(reference))
+            # The file connector uses flock on Linux; exercise its pinned open.
+            import sys
+            if sys.platform != "linux":
+                pytest.skip("Linux flock")
+            _wait_for_lock(Path(f"{reference}.lock"), **store._file_options)
+        else:
+            getattr(store, operation)(str(reference))
+
+
+@pytest.mark.parametrize("change", [None, "modify", "replace"])
+def test_file_tensor_bytes_reuses_pinned_file_and_detects_changes(tmp_path, monkeypatch, change):
+    import os
+    import sys
+    from contextlib import contextmanager
+    import safetensors
+    from safetensors.torch import save_file
+    from verl_speco.producer import hidden_states_store as module
+    if change == "replace" and sys.platform != "linux":
+        pytest.skip("Linux replacement of an open file")
+    reference = tmp_path / "sample.safetensors"
+    save_file({"hidden_states": torch.arange(8, dtype=torch.float32)}, str(reference))
+    original = reference.stat()
+    opened = []
+    regular_file, safe_open = module.regular_file, safetensors.safe_open
+    @contextmanager
+    def counted_file(*args, **kwargs):
+        with regular_file(*args, **kwargs) as stream:
+            opened.append(stream.fileno())
+            yield stream
+    def inspect(pinned, **kwargs):
+        if change == "replace":
+            reference.rename(tmp_path / "original")
+            save_file({"other": torch.zeros(1)}, str(reference))
+        elif change == "modify":
+            with reference.open("r+b") as stream:
+                stream.seek(-1, 2)
+                stream.write(b"\x00")
+            os.utime(reference, ns=(original.st_atime_ns, original.st_mtime_ns + 1_000_000))
+        assert os.stat(pinned).st_ino == original.st_ino
+        return safe_open(pinned, **kwargs)
+    monkeypatch.setattr(module, "regular_file", counted_file)
+    monkeypatch.setattr(module, "regular_path", lambda *a, **k: pytest.fail("reopened file name"))
+    monkeypatch.setattr(safetensors, "safe_open", inspect)
+    store = FileHiddenStatesStore(str(tmp_path), wait_for_writer=False)
+    if change is None:
+        assert store.tensor_bytes(str(reference)) == 32
+    else:
+        with pytest.raises(ValueError, match="changed during byte accounting"):
+            store.tensor_bytes(str(reference))
+    assert len(opened) == 1

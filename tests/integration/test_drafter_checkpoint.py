@@ -158,6 +158,15 @@ def test_optimizer_manifest_requires_complete_dcp_state(tmp_path) -> None:
     assert get_drafter_optimizer_checkpoint_path(checkpoint) == str(optimizer)
 
 
+@pytest.mark.parametrize("path", ["../external", "C:external", "C:/external", "//server/share/optimizer"])
+def test_optimizer_manifest_rejects_paths_outside_checkpoint(tmp_path, path):
+    from verl_speco.trainer.checkpoint import get_drafter_optimizer_manifest
+    (tmp_path / "metadata.json").write_text(json.dumps({"optimizer": {
+        "format": "torch_distributed_checkpoint", "path": path}}), encoding="utf-8")
+    with pytest.raises(DrafterCheckpointMetadataError, match="Invalid drafter optimizer checkpoint path"):
+        get_drafter_optimizer_manifest(tmp_path)
+
+
 def test_resolve_rejects_checkpoint_with_mismatched_metadata_step(tmp_path) -> None:
     original_model = tmp_path / "original"
     original_model.mkdir()

@@ -133,7 +133,12 @@ def _create_dflash_mask_mod(
         is_draft = kv_idx >= ctx_len
         kv_block_id = (kv_idx - ctx_len) // block_size
         mask_draft = is_draft & (q_block_id == kv_block_id)
-        return (mask_context | mask_draft) & block_keep_mask[b, q_block_id]
+        keep = block_keep_mask[b, q_block_id]
+        # Match the dense path: an unused query sees only its own draft key.
+        # Some attention kernels produce NaN for completely masked rows.
+        return ((mask_context | mask_draft) & keep) | (
+            ~keep & (kv_idx == ctx_len + q_idx)
+        )
 
     dflash_mask_mod.__name__ = (
         f"dflash_mask_A{anchor_positions.shape[1]}_B{block_size}_C{ctx_len}"

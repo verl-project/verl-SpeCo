@@ -367,3 +367,197 @@ def test_native_mrv2_example_is_isolated_and_keeps_baseline_parameters() -> None
         "DRAFTER_PATH=${DRAFTER_PATH:-/path/to/vllm-compatible-dspark-drafter}"
         in mrv2_source
     )
+
+
+@pytest.fixture
+def two_node_controller(monkeypatch):
+    import importlib.util
+    import sys
+    import types
+
+    # The controller logic under test does not open an SSH connection.
+    monkeypatch.setitem(sys.modules, "paramiko", types.ModuleType("paramiko"))
+    path = ROOT / "examples" / "dspark_two_node" / "run.py"
+    spec = importlib.util.spec_from_file_location("two_node_controller", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+@pytest.mark.parametrize(
+    "device, selected_busy, expected_error",
+    [(2, False, None), (2, True, "Logical NPU 2 is busy"), (3, False, "Cannot map logical NPU 3")],
+)
+def test_two_node_preflight_checks_only_selected_npu(
+    two_node_controller, monkeypatch, tmp_path, device, selected_busy, expected_error
+):
+    from types import SimpleNamespace
+
+    controller = two_node_controller
+    bash = _require_working_bash()
+    launcher = tmp_path / "examples/run_qwen3-8b_drafter_dspark_separate_training.sh"
+    launcher.parent.mkdir()
+    for path in (launcher, tmp_path / "config.json", tmp_path / "data.jsonl"):
+        path.touch()
+
+    busy_result = "123 vllm 59000" if selected_busy else "No process in device."
+    npu_stub = f"""
+npu-smi() {{
+    case "$*" in
+        'info -m') printf '%s\n' '0 0 0 0 Ascend910' '7 0 2 14 Ascend910' ;;
+        'info -t proc-mem -i 0 -c 0') echo '123 vllm 59000' ;;
+        'info -t proc-mem -i 7 -c 0') echo '{busy_result}' ;;
+        'info -t health -i 7 -c 0') echo 'Health Status : OK' ;;
+        *) return 1 ;;
+    esac
+}}
+ss() {{ :; }}
+"""
+    monkeypatch.setattr(controller, "setup_script", lambda *_: npu_stub)
+
+    results = []
+
+    def capture(_host, script):
+        results.append(
+            subprocess.run([bash, "-ec", script], cwd=tmp_path, text=True, capture_output=True)
+        )
+
+    monkeypatch.setattr(controller, "execute", capture)
+    args = SimpleNamespace(root=".", repo=".", model=".", data="data.jsonl", producer_npu=device)
+    controller.check(None, args, "producer")
+    (result,) = results
+    if expected_error is None:
+        assert result.returncode == 0, result.stderr
+    else:
+        assert result.returncode != 0
+        assert expected_error in result.stdout
+
+
+@pytest.mark.parametrize("resume", [False, True])
+@pytest.mark.parametrize("failure", [None, "start", "execute"])
+def test_two_node_phase_stops_readers_before_source(
+    two_node_controller, monkeypatch, resume, failure
+):
+    from types import SimpleNamespace
+
+    controller = two_node_controller
+    stopped = []
+    monkeypatch.setattr(controller, "prepare", lambda host, args, role, *rest: role)
+    monkeypatch.setattr(
+        controller, "stop", lambda host, directory: stopped.append(host)
+    )
+    monkeypatch.setattr(controller, "wait_service", lambda *args: None)
+
+    def operation(name):
+        def run(*args, **kwargs):
+            if name == failure:
+                raise RuntimeError("injected phase failure")
+
+        return run
+
+    monkeypatch.setattr(controller, "start", operation("start"))
+    monkeypatch.setattr(controller, "execute", operation("execute"))
+    args = SimpleNamespace(consumer="10.0.0.1", producer="10.0.0.2", data="/data")
+    if failure:
+        with pytest.raises(RuntimeError, match="injected phase failure"):
+            controller.phase(args, ("reader", "source"), "job", "/checkpoint", resume)
+    else:
+        controller.phase(args, ("reader", "source"), "job", "/checkpoint", resume)
+    assert stopped == ["reader", "source"]
+
+
+def test_two_node_failed_reader_shutdown_preserves_source(
+    two_node_controller, monkeypatch
+):
+    stopped = []
+
+    def stop(host, directory):
+        stopped.append(host)
+        if host == "reader":
+            raise OSError("reader unreachable")
+
+    monkeypatch.setattr(two_node_controller, "stop", stop)
+    with pytest.raises(RuntimeError, match="preserving Producer resources") as error:
+        two_node_controller.stop_phase("reader", "/consumer", "source", "/producer")
+    assert isinstance(error.value.__cause__, OSError)
+    assert stopped == ["reader"]
+
+
+@pytest.mark.parametrize("width,layers,dtype,dtype_bytes", [
+    (4096, 36, "bfloat16", 2), (8192, 64, "float64", 8), (128, 8, "fp32", 4),
+    (128, 5, "bfloat16", 2), (128, 6, "bfloat16", 2), (128, 7, "bfloat16", 2),
+    (128, 36, "unknown", 0),
+])
+def test_two_node_native_budget_covers_long_samples(two_node_controller, monkeypatch, width, layers, dtype, dtype_bytes):
+    import json
+    import io
+    import shlex
+    from contextlib import contextmanager, nullcontext
+    from types import SimpleNamespace
+
+    staged = {}
+
+    @contextmanager
+    def write_remote(path, mode):
+        stream = io.BytesIO()
+        yield stream
+        staged[Path(path).name] = stream.getvalue().decode()
+
+    client = SimpleNamespace(
+        open_sftp=lambda: nullcontext(SimpleNamespace(open=write_remote))
+    )
+    monkeypatch.setattr(two_node_controller, "execute",
+        lambda *args: json.dumps({"num_hidden_layers": layers,"hidden_size": width,"torch_dtype":dtype}))
+    args = SimpleNamespace(
+        root="/jobs",
+        repo="/repo",
+        model="/model",
+        consumer="10.0.0.1",
+        producer="10.0.0.2",
+        consumer_npu=0,
+        producer_npu=0,
+        consumer_env=None,
+    )
+    if layers < 8 or dtype_bytes == 0:
+        with pytest.raises(ValueError, match="distinct auxiliary layers|Unsupported model dtype"):
+            two_node_controller.prepare(client, args, "consumer", "test", "token", 0)
+        assert not staged
+        return
+    two_node_controller.prepare(client, args, "consumer", "test", "token", 0)
+    env = dict(
+        shlex.split(line.removeprefix("export "))[0].split("=", 1)
+        for line in staged["job.env"].splitlines()
+        if line.startswith("export ")
+    )
+    # Full 8k Qwen3-8B capture (five auxiliary layers + final layer), token IDs,
+    # and conservative space for both aligned payload and validity registrations.
+    payload_bytes = 8192 * width * 6 * dtype_bytes + 8192 * 8
+    assert json.loads(env["VLLM_AUX_HIDDEN_STATE_LAYER_IDS"])[-1] == layers - 3
+    assert len(set(json.loads(env["VLLM_AUX_HIDDEN_STATE_LAYER_IDS"]))) == 5
+    registered_bytes = payload_bytes + 4 * 1024**2
+    assert int(env["SPECO_NATIVE_READER_MAX_BYTES"]) >= registered_bytes
+    assert int(env["SPECO_NATIVE_SOURCE_MAX_BYTES"]) >= (
+        int(env["SPECO_NATIVE_SOURCE_MAX_SLOTS"]) * registered_bytes
+    )
+
+
+def test_two_node_ray_temp_is_unique_and_cleaned(tmp_path):
+    import os
+    import shutil
+    import subprocess
+    bash = shutil.which("bash")
+    if bash is None:
+        pytest.skip("bash unavailable")
+    source = (Path(__file__).resolve().parents[2] / "tools/dspark_two_node/ray.sh").read_text()
+    # Exercise the real temp-directory lifecycle without starting a Ray service.
+    source = source.replace("python3 -c 'from ray.scripts.scripts import main; main()' start", "true")
+    (tmp_path / "job.env").write_text("\n".join([
+        "SPECO_NATIVE_RUN_ID=speco-ci-reuse", "ROLE=consumer",
+        "HOST_IP=127.0.0.1", "CONSUMER_NPU=0", "",
+    ]))
+    paths = []
+    for _ in range(2):
+        subprocess.run([bash, "-c", source], cwd=tmp_path, check=True, env=os.environ.copy())
+        paths.append((tmp_path / "ray.tmp").read_text().strip())
+    assert paths[0] != paths[1]
+    assert all(not Path(path).exists() for path in paths)

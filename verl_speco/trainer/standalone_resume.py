@@ -15,50 +15,273 @@
 
 from __future__ import annotations
 
+from verl_speco.regular_file import regular_file
+
+import gzip
+import tempfile
+from contextlib import nullcontext
 import hashlib
 import json
 import os
+import re
+import uuid
+import zlib
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable, Mapping
 
 import torch
 
 RESUME_METADATA_NAME = "standalone_resume.json"
 CONSUMED_SEQUENCE_NAME = "consumed_sequence_nos.pt"
+CONSUMED_GZIP_NAME = "consumed_sequence_nos.i64.gz"
 RESUME_SCHEMA_VERSION = 1
-# Full content hashing is cheap enough for ordinary JSONL shards; very large
-# shards are sampled deterministically so a multi-node resume does not depend
-# on node-local mtimes or on reading terabytes at every checkpoint.
+_COMPRESSED_SCHEMA_VERSION = 2
+_IMMUTABLE_SCHEMA_VERSION = 3
+_COMPRESSED_CODEC = "gzip-delta-int64-le-v1"
+_MAX_COMPRESSED_ENTRIES = 100_000_000
+_MAX_ENCODED_BYTES = 1024**3
+_CHUNK_ENTRIES = 131_072
 _HASH_FULL_LIMIT_BYTES = 64 * 1024 * 1024
 _HASH_CHUNK_BYTES = 64 * 1024
 _HASH_SAMPLE_COUNT = 6
 
 
-def _file_content_fingerprint(file_path: Path) -> dict[str, Any]:
-    size = int(file_path.stat().st_size)
+def producer_data_recipe(config: Mapping[str, Any]) -> dict[str, Any]:
+    """Capture Producer settings that alter selected tokens or sample admission."""
+    defaults = {
+        "max_sequence_length": 8192,
+        "max_feature_length": 512,
+        "generation_max_tokens": 511,
+        "min_supervised_tokens": 1,
+        "on_error": "skip",
+        "on_missing_response": "skip",
+        "on_truncated_supervision": "keep",
+        "parser_strict_roles": False,
+    }
+    settings = {key: config.get(key, default) for key, default in defaults.items()}
+    for key in (
+        "max_sequence_length",
+        "max_feature_length",
+        "generation_max_tokens",
+        "min_supervised_tokens",
+    ):
+        settings[key] = int(settings[key] or 0)
+    for key in ("on_error", "on_missing_response", "on_truncated_supervision"):
+        settings[key] = str(settings[key] or defaults[key])
+    settings["on_missing_response"] = settings["on_missing_response"].lower()
+    settings["parser_strict_roles"] = bool(settings["parser_strict_roles"])
+    stable_source_ids = config.get("stable_source_ids", False)
+    if type(stable_source_ids) is not bool:
+        raise ValueError("stable_source_ids must be a boolean")
+    if stable_source_ids:
+        settings["stable_source_ids"] = True
+    if config.get("source_route_wave_samples", 0):
+        settings["source_routing"] = {
+            "wave_samples": config["source_route_wave_samples"],
+            "max_samples": config.get("source_route_max_samples", 64),
+            "max_tokens": config.get("source_route_max_tokens", 1048576),
+            "max_sequence_tokens": config.get(
+                "source_route_max_sequence_tokens", 65536
+            ),
+            "endpoints": list(config.get("vllm_endpoints") or []),
+        }
+    settings["render_boundary"] = bool(
+        (config.get("render_boundary") or {}).get("enabled", False)
+    )
+    return {"version": 1, "settings": settings}
+
+
+def _file_sha256(path: Path) -> str:
+    if path.is_symlink():
+        raise ValueError(
+            f"Input fingerprint requires regular files without symlinks: {path}. Copy with symlinks expanded"
+        )
     digest = hashlib.sha256()
-    digest.update(str(size).encode())
-    with file_path.open("rb") as stream:
-        if size <= _HASH_FULL_LIMIT_BYTES:
+    with regular_file(path) as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def model_cache_content_sha256(directory: str | os.PathLike[str]) -> str:
+    """Hash all regular files by relative path and contents, independent of cache location."""
+    root = Path(directory)
+    symlink_error = "Content-verified model cache requires files and directories without symlinks; copy the HF snapshot with symlinks expanded (cp -rL)"
+    if any(path.is_symlink() for path in (root, *root.parents)):
+        raise ValueError(symlink_error)
+    if not root.is_dir():
+        raise ValueError("Content-verified model cache must be a local directory")
+    files, directories = [], []
+
+    def fail(error):
+        raise error
+
+    for current, children, names in os.walk(root, followlinks=False, onerror=fail):
+        current_path = Path(current)
+        directories.append((current_path, current_path.stat().st_mtime_ns))
+        children.sort()
+        for child in children:
+            if (current_path / child).is_symlink():
+                raise ValueError(symlink_error)
+        for name in sorted(names):
+            path = current_path / name
+            if path.is_symlink():
+                raise ValueError(symlink_error)
+            if not path.is_file():
+                raise ValueError("Model cache contains a non-regular file")
+            files.append(path)
+            if len(files) > 100_000:
+                raise ValueError("Model cache exceeds the file count limit")
+    if not (root / "config.json").is_file() or not any(
+        path.suffix in {".safetensors", ".bin", ".pt", ".pth"} for path in files
+    ):
+        raise ValueError("Model cache must contain config.json and model files")
+    digest = hashlib.sha256(b"speco-model-cache-v1\0")
+    for path in sorted(files, key=lambda item: item.relative_to(root).as_posix()):
+        relative_name = path.relative_to(root).as_posix().encode("utf-8")
+        link_before = path.lstat()
+        with regular_file(path) as stream:
+            before = os.fstat(stream.fileno())
+            digest.update(len(relative_name).to_bytes(8, "big"))
+            digest.update(relative_name)
+            digest.update(before.st_size.to_bytes(8, "big"))
             for chunk in iter(lambda: stream.read(1024 * 1024), b""):
                 digest.update(chunk)
-        else:
-            offsets = {0, max(size - _HASH_CHUNK_BYTES, 0)}
-            for index in range(1, _HASH_SAMPLE_COUNT):
-                offsets.add((size * index) // _HASH_SAMPLE_COUNT)
-            for offset in sorted(offsets):
-                stream.seek(offset)
-                digest.update(stream.read(_HASH_CHUNK_BYTES))
-    return {"size_bytes": size, "sha256": digest.hexdigest()}
+            after = os.fstat(stream.fileno())
+        link_after, current_stat = path.lstat(), path.stat()
+
+        def signature(item):
+            return (
+                item.st_dev,
+                item.st_ino,
+                item.st_size,
+                item.st_mtime_ns,
+                item.st_ctime_ns,
+            )
+
+        # Windows may report different ctime semantics for fstat and stat.
+        if (
+            signature(before) != signature(after)
+            or signature(before)[:4] != signature(current_stat)[:4]
+            or signature(link_before) != signature(link_after)
+        ):
+            raise ValueError("Model cache changed while being fingerprinted")
+    if any(path.stat().st_mtime_ns != mtime for path, mtime in directories):
+        raise ValueError("Model cache directory changed while being fingerprinted")
+    return digest.hexdigest()
 
 
-def _fingerprint_identity(fingerprint: dict[str, Any]) -> dict[str, Any]:
-    """Fields that must match on resume; the mount path is informational only."""
+def _write_compressed_sequences(values: torch.Tensor, path: Path) -> str:
+    """Stream sorted int64 deltas without materializing the full decoded blob."""
+    import numpy as np
 
-    return {key: value for key, value in fingerprint.items() if key != "path"}
+    if values.numel() > _MAX_COMPRESSED_ENTRIES:
+        raise ValueError("Compressed resume progress exceeds the entry limit")
+    digest = hashlib.sha256()
+    previous = 0
+    with path.open("wb") as raw:
+        with gzip.GzipFile(
+            filename="", fileobj=raw, mode="wb", compresslevel=1, mtime=0
+        ) as stream:
+            for start in range(0, values.numel(), _CHUNK_ENTRIES):
+                chunk = (
+                    values[start : start + _CHUNK_ENTRIES]
+                    .numpy()
+                    .astype("<i8", copy=False)
+                )
+                deltas = np.empty(chunk.size, dtype="<i8")
+                deltas[0] = int(chunk[0]) - previous
+                np.subtract(chunk[1:], chunk[:-1], out=deltas[1:])
+                previous = int(chunk[-1])
+                payload = deltas.tobytes()
+                digest.update(payload)
+                stream.write(payload)
+        raw.flush()
+        os.fsync(raw.fileno())
+    if path.stat().st_size > _MAX_ENCODED_BYTES:
+        raise ValueError("Compressed resume progress exceeds the encoded byte limit")
+    return digest.hexdigest()
 
 
-def build_input_fingerprint(path: str | os.PathLike[str]) -> dict[str, Any]:
+def _validate_compressed_progress(path: Path, metadata: dict[str, Any]) -> int:
+    count = metadata.get("consumed_count")
+    decoded_bytes = metadata.get("consumed_sequence_decoded_bytes")
+    if (
+        type(count) is not int
+        or count < 0
+        or count > _MAX_COMPRESSED_ENTRIES
+        or type(decoded_bytes) is not int
+        or decoded_bytes != count * 8
+    ):
+        raise ValueError("Invalid compressed resume progress descriptor")
+    if path.is_symlink() or not path.is_file():
+        raise ValueError("Compressed resume progress must be a regular file")
+    encoded_limit = min(_MAX_ENCODED_BYTES, max(4096, decoded_bytes * 2 + 4096))
+    if path.stat().st_size > encoded_limit:
+        raise ValueError("Compressed resume progress exceeds the encoded byte limit")
+    return count
+
+
+def _read_compressed_sequences(
+    path: Path, metadata: dict[str, Any], *, encoded_snapshot=None
+) -> set[int]:
+    """Validate checksums, decoded length and strictly increasing int64 values."""
+    import numpy as np
+
+    decoded_sha = metadata.get("consumed_sequence_decoded_sha256")
+    if (
+        not isinstance(decoded_sha, str)
+        or re.fullmatch(r"[0-9a-f]{64}", decoded_sha) is None
+    ):
+        raise ValueError("Invalid compressed resume progress descriptor")
+    count = _validate_compressed_progress(path, metadata)
+    digest = hashlib.sha256()
+    consumed: set[int] = set()
+    previous = 0
+    seen = 0
+    try:
+        with (
+            (
+                regular_file(path)
+                if encoded_snapshot is None
+                else nullcontext(encoded_snapshot)
+            ) as encoded,
+            gzip.GzipFile(fileobj=encoded, mode="rb") as stream,
+        ):
+            while seen < count:
+                chunk_count = min(_CHUNK_ENTRIES, count - seen)
+                payload = stream.read(chunk_count * 8)
+                if len(payload) != chunk_count * 8:
+                    raise ValueError("Compressed resume progress is truncated")
+                digest.update(payload)
+                deltas = np.frombuffer(payload, dtype="<i8")
+                if np.any(deltas < 0) or np.any(deltas[1 if seen == 0 else 0 :] == 0):
+                    raise ValueError("Invalid compressed resume sequence deltas")
+                cumulative = np.cumsum(deltas, dtype=np.int64)
+                if (
+                    np.any(cumulative < 0)
+                    or np.any(np.diff(cumulative) < 0)
+                    or int(cumulative[-1]) > (2**63 - 1) - previous
+                ):
+                    raise ValueError("Compressed resume sequence overflow")
+                values = cumulative + previous
+                consumed.update(values.tolist())
+                previous = int(values[-1])
+                seen += chunk_count
+            if stream.read(1):
+                raise ValueError("Compressed resume progress exceeds decoded size")
+    except (OSError, EOFError, zlib.error) as exc:
+        raise ValueError("Invalid compressed resume progress") from exc
+    if digest.hexdigest() != decoded_sha or len(consumed) != count:
+        raise ValueError("Compressed resume progress checksum or count mismatch")
+    return consumed
+
+
+def build_input_fingerprint(
+    path: str | os.PathLike[str],
+    *,
+    include_content_hash: bool = True,
+) -> dict[str, Any]:
     input_path = Path(path).resolve()
     if input_path.is_dir():
         metadata_path = input_path / "metadata.json"
@@ -69,14 +292,10 @@ def build_input_fingerprint(path: str | os.PathLike[str]) -> dict[str, Any]:
                 ("metadata.json", metadata_path),
                 ("manifest.jsonl", manifest_path),
             ):
-                digest = hashlib.sha256()
-                with file_path.open("rb") as stream:
-                    for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-                        digest.update(chunk)
-                fingerprints[name] = digest.hexdigest()
+                fingerprints[name] = _file_sha256(file_path)
             shard_fingerprints: dict[str, dict[str, int]] = {}
             try:
-                with manifest_path.open(encoding="utf-8") as stream:
+                with regular_file(manifest_path) as stream:
                     for line in stream:
                         if not line.strip():
                             continue
@@ -122,10 +341,235 @@ def build_input_fingerprint(path: str | os.PathLike[str]) -> dict[str, Any]:
                 for file_path in directory_files
             },
         }
-    return {
+    from verl_speco.producer.input_reader import detect_input_format
+
+    stat = input_path.stat()
+    fingerprint = {
+        "parser_format": detect_input_format(input_path),
         "path": str(input_path),
-        **_file_content_fingerprint(input_path),
+        "size_bytes": int(stat.st_size),
+        "mtime_ns": int(stat.st_mtime_ns),
     }
+    if include_content_hash:
+        if not input_path.is_file():
+            raise ValueError(
+                f"Standalone resume input must be a regular file: {input_path}"
+            )
+        fingerprint["sha256"] = _file_sha256(input_path)
+        after = input_path.stat()
+        if (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns) != (
+            after.st_dev,
+            after.st_ino,
+            after.st_size,
+            after.st_mtime_ns,
+        ):
+            raise ValueError(
+                "Standalone resume input changed while being fingerprinted"
+            )
+    return fingerprint
+
+
+def input_content_identity(fingerprint: Mapping[str, Any]) -> dict[str, Any]:
+    """Return a path-independent identity backed by a complete content digest."""
+    if not isinstance(fingerprint, Mapping):
+        raise ValueError("Standalone input fingerprint is missing")
+    digest: object
+    if fingerprint.get("format") == "standalone_raw_hidden":
+        files = fingerprint.get("files")
+        if (
+            not isinstance(files, Mapping)
+            or set(files) != {"metadata.json", "manifest.jsonl"}
+            or any(
+                not isinstance(value, str)
+                or re.fullmatch(r"[0-9a-f]{64}", value) is None
+                for value in files.values()
+            )
+        ):
+            raise ValueError(
+                "Raw hidden input fingerprint requires both manifest checksums"
+            )
+        digest = hashlib.sha256(
+            json.dumps(dict(files), sort_keys=True).encode()
+        ).hexdigest()
+        identity: dict[str, Any] = {"kind": "raw_hidden", "sha256": digest}
+    else:
+        digest = fingerprint.get("sha256")
+        size = fingerprint.get("size_bytes")
+        if type(size) is not int or size < 0:
+            raise ValueError("Standalone input fingerprint has invalid size")
+        identity = {"kind": "file", "sha256": digest, "size_bytes": size}
+    if (
+        not isinstance(digest, str)
+        or len(digest) != 64
+        or any(c not in "0123456789abcdef" for c in digest)
+    ):
+        raise ValueError("Standalone input fingerprint requires a SHA-256 digest")
+    return identity
+
+
+def validate_input_identity(identity: Any) -> dict[str, Any]:
+    if not isinstance(identity, dict):
+        raise ValueError("Standalone input identity is missing")
+    kind = identity.get("kind")
+    if kind == "file" and set(identity) == {"kind", "sha256", "size_bytes"}:
+        reconstructed = input_content_identity(
+            {"sha256": identity["sha256"], "size_bytes": identity["size_bytes"]}
+        )
+    elif kind == "raw_hidden" and set(identity) == {"kind", "sha256"}:
+        digest = identity["sha256"]
+        if not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+            raise ValueError("Standalone input identity is malformed")
+        reconstructed = dict(identity)
+    else:
+        raise ValueError("Standalone input identity is malformed")
+    if reconstructed != identity:
+        raise ValueError("Standalone input identity is malformed")
+    return reconstructed
+
+
+def validate_reference_lease_snapshot(snapshot):
+    if (
+        not isinstance(snapshot, dict)
+        or type(snapshot.get("version")) is not int
+        or snapshot["version"] != 1
+    ):
+        raise ValueError("Invalid reference lease snapshot")
+    digest = snapshot.get("sha256")
+    payload = {key: value for key, value in snapshot.items() if key != "sha256"}
+    encoded = json.dumps(
+        payload, sort_keys=True, separators=(",", ":"), allow_nan=False
+    ).encode()
+    if (
+        len(encoded) > 16 * 1024**2
+        or not isinstance(digest, str)
+        or hashlib.sha256(encoded).hexdigest() != digest
+    ):
+        raise ValueError("Reference lease snapshot checksum or size differs")
+    incarnation = snapshot.get("incarnation")
+    if not isinstance(incarnation, str) or not 1 <= len(incarnation) <= 256:
+        raise ValueError("Invalid reference lease snapshot incarnation")
+    if snapshot.get("drained") is True:
+        if set(snapshot) != {"version", "incarnation", "drained", "sha256"}:
+            raise ValueError("Invalid drained reference lease snapshot")
+        return snapshot
+    if (
+        set(snapshot)
+        != {
+            "version",
+            "run_id",
+            "incarnation",
+            "leases",
+            "payloads",
+            "acknowledgements",
+            "sha256",
+        }
+        or not isinstance(snapshot["run_id"], str)
+        or not snapshot["run_id"]
+        or any(
+            not isinstance(snapshot[key], list)
+            for key in ("leases", "payloads", "acknowledgements")
+        )
+    ):
+        raise ValueError("Invalid reference lease snapshot structure")
+    owners, phases, ack_counts, lease_keys = {}, {}, {}, {}
+    for row in snapshot["leases"]:
+        if (
+            not isinstance(row, list)
+            or len(row) != 3
+            or type(row[0]) is not int
+            or row[0] < 0
+            or row[0] in owners
+            or not isinstance(row[1], str)
+            or row[1]
+            not in {
+                "DISPATCH_INTENT",
+                "LEASED",
+                "MATERIALIZED",
+                "RELEASE_INTENT",
+                "RELEASED",
+            }
+            or not isinstance(row[2], str)
+        ):
+            raise ValueError("Invalid snapshot lease record")
+        identity = json.loads(row[2])
+        if (
+            not isinstance(identity, dict)
+            or type(identity.get("owner_count")) is not int
+            or not 0 <= identity["owner_count"] <= 65536
+            or not isinstance(identity.get("keys"), list)
+            or not identity["keys"]
+            or any(not isinstance(key, str) or not key for key in identity["keys"])
+            or len(set(identity["keys"])) != len(identity["keys"])
+            or not isinstance(identity.get("receipt"), str)
+            or not identity["receipt"]
+        ):
+            raise ValueError("Invalid snapshot lease identity")
+        owners[row[0]] = identity["owner_count"]
+        phases[row[0]], ack_counts[row[0]] = row[1], 0
+        lease_keys[row[0]] = set(identity["keys"])
+    acknowledgements = set()
+    for row in snapshot["acknowledgements"]:
+        if (
+            not isinstance(row, list)
+            or len(row) != 2
+            or any(type(value) is not int for value in row)
+            or row[0] not in owners
+            or phases[row[0]] == "DISPATCH_INTENT"
+            or not 0 <= row[1] < owners[row[0]]
+            or tuple(row) in acknowledgements
+        ):
+            raise ValueError("Invalid snapshot acknowledgement")
+        acknowledgements.add(tuple(row))
+        ack_counts[row[0]] += 1
+    if any(
+        phases[plan] in {"MATERIALIZED", "RELEASE_INTENT", "RELEASED"}
+        and ack_counts[plan] != owners[plan]
+        for plan in owners
+    ):
+        raise ValueError("Snapshot lease is missing owner acknowledgements")
+    payloads = set()
+    for row in snapshot["payloads"]:
+        if (
+            not isinstance(row, list)
+            or len(row) != 2
+            or not isinstance(row[0], str)
+            or not row[0]
+            or row[0] in payloads
+            or not isinstance(row[1], str)
+        ):
+            raise ValueError("Invalid snapshot payload identity")
+        entry = json.loads(row[1])
+        if not isinstance(entry, dict) or entry.get("key") != row[0]:
+            raise ValueError("Snapshot payload key differs")
+        payloads.add(row[0])
+    assigned = set()
+    for plan, keys in lease_keys.items():
+        if phases[plan] != "RELEASED":
+            if not keys <= payloads or assigned & keys:
+                raise ValueError(
+                    "Snapshot lease payload dependencies are missing or duplicated"
+                )
+            assigned.update(keys)
+    return snapshot
+
+
+def _load_reference_lease_snapshot(checkpoint_dir, digest):
+    path = checkpoint_dir / "reference_leases.json"
+    limit = 64 * 1024**2
+    if path.is_symlink() or not path.is_file() or path.stat().st_size > limit:
+        raise ValueError(
+            "Reference lease snapshot is missing or exceeds metadata budget"
+        )
+    # Bound the read itself: a producer or shared filesystem may change the file
+    # after stat(), so the size check alone cannot enforce the metadata budget.
+    with regular_file(path) as stream:
+        encoded = stream.read(limit + 1)
+    if len(encoded) > limit:
+        raise ValueError("Reference lease snapshot exceeds metadata budget")
+    snapshot = validate_reference_lease_snapshot(json.loads(encoded.decode("utf-8")))
+    if snapshot["sha256"] != digest:
+        raise ValueError("Reference lease snapshot differs from resume metadata")
+    return snapshot
 
 
 def parse_bool_setting(value: Any, *, default: bool) -> bool:
@@ -154,12 +598,46 @@ def save_standalone_resume(
     optimizer_step: int,
     input_path: str | os.PathLike[str],
     producer_shuffle: dict[str, Any] | None = None,
+    training_plan: dict[str, Any] | None = None,
+    storage_format: str = "tensor",
+    expected_input_identity: Mapping[str, Any] | None = None,
+    input_fingerprint_provider: Callable[[], dict[str, Any]] | None = None,
+    lease_snapshot_sha256: str | None = None,
     data_progress: dict[str, Any] | None = None,
     loader_config: dict[str, Any] | None = None,
     input_fingerprint: dict[str, Any] | None = None,
 ) -> None:
+    if not isinstance(storage_format, str) or storage_format not in {"tensor", "gzip"}:
+        raise ValueError("Standalone resume storage_format must be tensor or gzip")
+    if input_fingerprint_provider is not None and expected_input_identity is None:
+        raise ValueError(
+            "A remote input fingerprint requires a bound Producer identity"
+        )
+
+    def checked_input_fingerprint():
+        fingerprint = (
+            input_fingerprint_provider()
+            if input_fingerprint_provider is not None
+            else input_fingerprint
+            if input_fingerprint is not None
+            else build_input_fingerprint(input_path, include_content_hash=True)
+        )
+        if (
+            expected_input_identity is not None
+            and input_content_identity(fingerprint) != expected_input_identity
+        ):
+            raise ValueError(
+                "Standalone input changed since training began; checkpoint cannot be published"
+            )
+        return fingerprint
+
+    if expected_input_identity is not None:
+        expected_input_identity = validate_input_identity(expected_input_identity)
+        checked_input_fingerprint()
     checkpoint_dir = Path(checkpoint_path)
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    if lease_snapshot_sha256 is not None:
+        _load_reference_lease_snapshot(checkpoint_dir, lease_snapshot_sha256)
     if isinstance(consumed_sequence_nos, torch.Tensor):
         values = consumed_sequence_nos.detach().to(device="cpu", dtype=torch.int64)
     else:
@@ -171,112 +649,347 @@ def save_standalone_resume(
     if values.numel() and int(values[0]) < 0:
         raise ValueError("consumed sequence numbers must be non-negative")
 
-    tensor_path = checkpoint_dir / CONSUMED_SEQUENCE_NAME
-    tensor_temporary = tensor_path.with_suffix(tensor_path.suffix + ".incomplete")
-    torch.save(values, tensor_temporary)
-    os.replace(tensor_temporary, tensor_path)
+    suffix = "i64.gz" if storage_format == "gzip" else "pt"
+    filename = f"consumed_sequence_nos.{uuid.uuid4().hex}.{suffix}"
+    data_path = checkpoint_dir / filename
+    temporary = data_path.with_suffix(data_path.suffix + ".incomplete")
+    try:
+        if storage_format == "gzip":
+            decoded_sha = _write_compressed_sequences(values, temporary)
+        else:
+            torch.save(values, temporary)
+        encoded_sha = _file_sha256(temporary)
+        with temporary.open("rb+") as data_stream:
+            os.fsync(data_stream.fileno())
+        os.replace(temporary, data_path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
-    metadata = {
-        "schema_version": RESUME_SCHEMA_VERSION,
-        "optimizer_step": int(optimizer_step),
-        "consumed_count": int(values.numel()),
-        "consumed_sequence_file": CONSUMED_SEQUENCE_NAME,
-        "input_fingerprint": (
-            input_fingerprint
-            if input_fingerprint is not None
-            else build_input_fingerprint(input_path)
-        ),
-    }
-    if producer_shuffle is not None:
-        # Consumed sequence numbers are position-based, so their meaning
-        # depends on the producer shuffle settings that produced them. Saved
-        # here so a resumed Producer can refuse a mismatched configuration
-        # instead of silently reordering the stream.
-        metadata["producer_shuffle"] = {
-            "shuffle": bool(producer_shuffle.get("shuffle", False)),
-            "shuffle_seed": int(producer_shuffle.get("shuffle_seed", 42)),
+    publish_attempted = False
+    try:
+        fingerprint = checked_input_fingerprint()
+        metadata = {
+            "schema_version": _IMMUTABLE_SCHEMA_VERSION,
+            "storage_format": storage_format,
+            "optimizer_step": int(optimizer_step),
+            "consumed_count": int(values.numel()),
+            "consumed_sequence_file": filename,
+            "consumed_sequence_sha256": encoded_sha,
+            "input_fingerprint": fingerprint,
         }
-    if data_progress is not None:
-        # Deterministic file stores do not need (or maintain) a per-sample
-        # consumed set; their loader order is a pure function of
-        # ``(seed, epoch, store)``. Persist the batch cursor instead so a
-        # resumed run continues at the exact epoch/batch position.
-        epoch = int(data_progress.get("epoch", 0) or 0)
-        batch_index = int(data_progress.get("batch_index", 0) or 0)
-        if epoch < 0 or batch_index < 0:
-            raise ValueError(f"data_progress must be non-negative: {data_progress!r}")
-        progress_metadata: dict[str, Any] = {
-            "epoch": epoch,
-            "batch_index": batch_index,
-        }
-        read_errors = data_progress.get("read_errors")
-        if read_errors is not None:
-            progress_metadata["read_errors"] = int(read_errors)
-        read_errors_exact = data_progress.get("read_errors_exact")
-        if read_errors_exact is not None:
-            progress_metadata["read_errors_exact"] = bool(read_errors_exact)
-        metadata["data_progress"] = progress_metadata
-    if loader_config is not None:
-        # The cursor is a batch ordinal over the filtered key order, so every
-        # setting that changes that order (batch size, sharding, shuffle/seed,
-        # filters, ...) must match on resume.
-        metadata["data_loader"] = {
-            str(key): value for key, value in loader_config.items()
-        }
-    metadata_path = checkpoint_dir / RESUME_METADATA_NAME
-    metadata_temporary = metadata_path.with_suffix(metadata_path.suffix + ".incomplete")
-    metadata_temporary.write_text(
-        json.dumps(metadata, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-    )
-    os.replace(metadata_temporary, metadata_path)
+        if expected_input_identity is not None:
+            metadata["input_content_identity"] = expected_input_identity
+        if lease_snapshot_sha256 is not None:
+            metadata["reference_lease_snapshot_sha256"] = lease_snapshot_sha256
+        if storage_format == "gzip":
+            metadata.update(
+                {
+                    "consumed_sequence_codec": _COMPRESSED_CODEC,
+                    "consumed_sequence_decoded_bytes": int(values.numel()) * 8,
+                    "consumed_sequence_decoded_sha256": decoded_sha,
+                }
+            )
+        if training_plan is not None:
+            metadata["training_plan"] = dict(training_plan)
+        if producer_shuffle is not None:
+            # Consumed sequence numbers are position-based, so their meaning
+            # depends on the producer shuffle settings that produced them. Saved
+            # here so a resumed Producer can refuse a mismatched configuration
+            # instead of silently reordering the stream.
+            shuffle_metadata: dict[str, Any] = {
+                "shuffle": bool(producer_shuffle.get("shuffle", False)),
+                "shuffle_seed": int(producer_shuffle.get("shuffle_seed", 42)),
+            }
+            if producer_shuffle.get("deterministic_publication", False):
+                shuffle_metadata["deterministic_publication"] = True
+            if producer_shuffle.get("source_proportional_field") is not None:
+                shuffle_metadata["source_proportional_field"] = producer_shuffle[
+                    "source_proportional_field"
+                ]
+            if producer_shuffle.get("data_recipe") is not None:
+                shuffle_metadata["data_recipe"] = producer_shuffle["data_recipe"]
+            metadata["producer_shuffle"] = shuffle_metadata
+        if data_progress is not None:
+            # Deterministic file stores do not need (or maintain) a per-sample
+            # consumed set; their loader order is a pure function of
+            # ``(seed, epoch, store)``. Persist the batch cursor instead so a
+            # resumed run continues at the exact epoch/batch position.
+            epoch = int(data_progress.get("epoch", 0) or 0)
+            batch_index = int(data_progress.get("batch_index", 0) or 0)
+            if epoch < 0 or batch_index < 0:
+                raise ValueError(
+                    f"data_progress must be non-negative: {data_progress!r}"
+                )
+            progress_metadata: dict[str, Any] = {
+                "epoch": epoch,
+                "batch_index": batch_index,
+            }
+            read_errors = data_progress.get("read_errors")
+            if read_errors is not None:
+                progress_metadata["read_errors"] = int(read_errors)
+            read_errors_exact = data_progress.get("read_errors_exact")
+            if read_errors_exact is not None:
+                progress_metadata["read_errors_exact"] = bool(read_errors_exact)
+            metadata["data_progress"] = progress_metadata
+        if loader_config is not None:
+            # The cursor is a batch ordinal over the filtered key order, so every
+            # setting that changes that order (batch size, sharding, shuffle/seed,
+            # filters, ...) must match on resume.
+            metadata["data_loader"] = {
+                str(key): value for key, value in loader_config.items()
+            }
+        metadata_path = checkpoint_dir / RESUME_METADATA_NAME
+        metadata_temporary = (
+            checkpoint_dir / f".{RESUME_METADATA_NAME}.{uuid.uuid4().hex}.incomplete"
+        )
+        try:
+            with metadata_temporary.open("w", encoding="utf-8") as stream:
+                json.dump(metadata, stream, ensure_ascii=False, indent=2)
+                stream.write("\n")
+                stream.flush()
+                os.fsync(stream.fileno())
+            publish_attempted = True
+            os.replace(metadata_temporary, metadata_path)
+            if os.name == "posix":
+                fd = os.open(
+                    checkpoint_dir, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+                )
+                try:
+                    os.fsync(fd)
+                finally:
+                    os.close(fd)
+        finally:
+            metadata_temporary.unlink(missing_ok=True)
+    except Exception:
+        # A failed replace can have an ambiguous outcome on remote filesystems.
+        if not publish_attempted:
+            data_path.unlink(missing_ok=True)
+        raise
 
 
 def load_standalone_resume(
     checkpoint_path: str | os.PathLike[str] | None,
     *,
     input_path: str | os.PathLike[str] | None = None,
+    input_fingerprint: Mapping[str, Any] | None = None,
     current_fingerprint: dict[str, Any] | None = None,
 ) -> tuple[set[int], dict[str, Any] | None]:
+    if input_fingerprint is None:
+        input_fingerprint = current_fingerprint
     if not checkpoint_path:
         return set(), None
     checkpoint_dir = Path(checkpoint_path)
     metadata_path = checkpoint_dir / RESUME_METADATA_NAME
+    if metadata_path.is_symlink():
+        raise ValueError("Standalone resume metadata must not be a symlink")
     if not metadata_path.is_file():
         return set(), None
-    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-    if int(metadata.get("schema_version", 0)) != RESUME_SCHEMA_VERSION:
+    with regular_file(metadata_path) as stream:
+        metadata = json.load(stream)
+    if "reference_lease_snapshot_sha256" in metadata:
+        _load_reference_lease_snapshot(
+            checkpoint_dir, metadata["reference_lease_snapshot_sha256"]
+        )
+    version = metadata.get("schema_version")
+    if type(version) is not int or version not in {
+        RESUME_SCHEMA_VERSION,
+        _COMPRESSED_SCHEMA_VERSION,
+        _IMMUTABLE_SCHEMA_VERSION,
+    }:
         raise ValueError(f"Unsupported standalone resume metadata: {metadata_path}")
-    tensor_name = metadata.get("consumed_sequence_file")
-    if tensor_name != CONSUMED_SEQUENCE_NAME:
-        raise ValueError(f"Invalid consumed sequence file in {metadata_path}")
-    tensor_path = checkpoint_dir / tensor_name
-    try:
-        values = torch.load(tensor_path, map_location="cpu", weights_only=True)
-    except TypeError:
-        values = torch.load(tensor_path, map_location="cpu")
-    if not isinstance(values, torch.Tensor) or values.dtype != torch.int64:
-        raise ValueError(f"Invalid consumed sequence tensor: {tensor_path}")
-    values = values.flatten()
-    if values.numel() and int(values[0]) < 0:
-        raise ValueError(f"Negative consumed sequence number in {tensor_path}")
-    consumed = {int(value) for value in values.tolist()}
-    if len(consumed) != int(metadata.get("consumed_count", -1)):
-        raise ValueError(f"Consumed sequence count mismatch in {checkpoint_dir}")
-    if input_path is not None or current_fingerprint is not None:
-        saved_fingerprint = metadata.get("input_fingerprint")
-        if current_fingerprint is None:
-            if input_path is None:
-                raise ValueError("load_standalone_resume requires input_path")
-            current_fingerprint = build_input_fingerprint(input_path)
-        if not isinstance(saved_fingerprint, dict) or _fingerprint_identity(
-            saved_fingerprint
-        ) != _fingerprint_identity(current_fingerprint):
+    saved_fingerprint = metadata.get("input_fingerprint")
+    saved_identity = None
+    if "input_content_identity" in metadata:
+        saved_identity = validate_input_identity(metadata["input_content_identity"])
+        if input_content_identity(saved_fingerprint) != saved_identity:
             raise ValueError(
-                "Standalone resume input file changed since the checkpoint was saved: "
-                f"saved={saved_fingerprint!r}, current={current_fingerprint!r}"
+                "Standalone saved input identity conflicts with its fingerprint"
             )
+    tensor_name = metadata.get("consumed_sequence_file")
+    compressed = version == _COMPRESSED_SCHEMA_VERSION
+    if version == _IMMUTABLE_SCHEMA_VERSION:
+        storage_format = metadata.get("storage_format")
+        if not isinstance(storage_format, str) or storage_format not in {
+            "tensor",
+            "gzip",
+        }:
+            raise ValueError(f"Invalid resume storage format in {metadata_path}")
+        compressed = storage_format == "gzip"
+        suffix = r"i64\.gz" if compressed else "pt"
+        valid_name = isinstance(tensor_name, str) and re.fullmatch(
+            rf"consumed_sequence_nos\.[0-9a-f]{{32}}\.{suffix}", tensor_name
+        )
+    else:
+        expected_name = CONSUMED_GZIP_NAME if compressed else CONSUMED_SEQUENCE_NAME
+        valid_name = tensor_name == expected_name
+    if not valid_name:
+        raise ValueError(f"Invalid consumed sequence file in {metadata_path}")
+    if compressed and metadata.get("consumed_sequence_codec") != _COMPRESSED_CODEC:
+        raise ValueError(f"Unsupported compressed resume codec in {metadata_path}")
+    tensor_path = checkpoint_dir / tensor_name
+    if tensor_path.is_symlink():
+        raise ValueError("Standalone resume tensor must not be a symlink")
+    if compressed:
+        _validate_compressed_progress(tensor_path, metadata)
+    expected_sha256 = metadata.get("consumed_sequence_sha256")
+    requires_hash = version in {_COMPRESSED_SCHEMA_VERSION, _IMMUTABLE_SCHEMA_VERSION}
+    if (expected_sha256 is not None or requires_hash) and (
+        not isinstance(expected_sha256, str) or len(expected_sha256) != 64
+    ):
+        raise ValueError(f"Invalid consumed sequence checksum in {metadata_path}")
+    # Hash and deserialize the same private snapshot. The named source may be
+    # replaced or modified after it is opened, including by another local job.
+    with (
+        regular_file(tensor_path) as source,
+        tempfile.SpooledTemporaryFile(max_size=8 * 1024**2) as snapshot,
+    ):
+        digest = hashlib.sha256()
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            snapshot.write(chunk)
+            digest.update(chunk)
+        if expected_sha256 is not None and digest.hexdigest() != expected_sha256:
+            raise ValueError(f"Consumed sequence checksum mismatch in {checkpoint_dir}")
+        snapshot.seek(0)
+        if compressed:
+            consumed = _read_compressed_sequences(
+                tensor_path, metadata, encoded_snapshot=snapshot
+            )
+        else:
+            values = torch.load(snapshot, map_location="cpu", weights_only=True)
+    if not compressed:
+        if not isinstance(values, torch.Tensor) or values.dtype != torch.int64:
+            raise ValueError(f"Invalid consumed sequence tensor: {tensor_path}")
+        values = values.flatten()
+        if values.numel() and bool((values < 0).any()):
+            raise ValueError(f"Negative consumed sequence number in {tensor_path}")
+        consumed = {int(value) for value in values.tolist()}
+        if len(consumed) != int(metadata.get("consumed_count", -1)):
+            raise ValueError(f"Consumed sequence count mismatch in {checkpoint_dir}")
+    if input_path is not None or input_fingerprint is not None:
+        include_content_hash = saved_identity is not None or (
+            isinstance(saved_fingerprint, dict) and "sha256" in saved_fingerprint
+        )
+        if input_fingerprint is not None:
+            current_fingerprint = dict(input_fingerprint)
+        else:
+            assert input_path is not None
+            current_fingerprint = build_input_fingerprint(
+                input_path, include_content_hash=include_content_hash
+            )
+        validate_resume_input_fingerprint(metadata, current_fingerprint)
     return consumed, metadata
+
+
+def validate_resume_input_fingerprint(metadata, fingerprint):
+    """Validate a remotely supplied input against already verified resume metadata."""
+    saved = metadata.get("input_fingerprint")
+    identity = metadata.get("input_content_identity")
+    current = dict(fingerprint)
+    if isinstance(saved, dict) and saved.get("format") in {
+        "jsonl_token_replay",
+        "directory",
+    }:
+        if _fingerprint_identity(saved) != _fingerprint_identity(current):
+            raise ValueError(
+                "Standalone resume input file changed since the checkpoint was saved"
+            )
+        return
+    if (
+        isinstance(saved, dict)
+        and saved.get("format") == "standalone_raw_hidden"
+        and "shards" in saved
+    ):
+        if saved["shards"] != current.get("shards"):
+            raise ValueError(
+                "Standalone resume input file changed since the checkpoint was saved"
+            )
+    if isinstance(saved, dict) and saved.get("format") is None:
+        saved_parser = saved.get("parser_format")
+        current_parser = current.get("parser_format")
+
+        def legacy_kind(path):
+            suffix = Path(path or "").suffix.lower()
+            return (
+                "parquet"
+                if suffix in {".pq", ".parquet"}
+                else "json"
+                if suffix == ".json"
+                else "jsonl"
+            )
+
+        if (saved_parser is not None and saved_parser != current_parser) or (
+            saved_parser is None
+            and legacy_kind(saved.get("path")) != legacy_kind(current.get("path"))
+        ):
+            raise ValueError(
+                "Standalone resume input parser format changed; identical bytes with a different parser cannot reuse consumed occurrences"
+            )
+        if saved_parser is None:
+            current.pop("parser_format", None)
+    if identity is not None:
+        identity = validate_input_identity(identity)
+        if input_content_identity(saved) != identity:
+            raise ValueError(
+                "Standalone saved input identity conflicts with its fingerprint"
+            )
+        differs = input_content_identity(current) != identity
+    else:
+        if isinstance(saved, dict) and "sha256" not in saved:
+            if saved.get("path") != current.get("path"):
+                raise ValueError(
+                    "Legacy checkpoint has no content hash. Producer-only cold resume "
+                    "requires Consumer-local input at the original path to verify and upgrade the checkpoint."
+                )
+            current.pop("sha256", None)
+        if isinstance(saved, dict) and "sha256" in saved:
+            differs = input_content_identity(saved) != input_content_identity(current)
+        else:
+            differs = saved != current
+    if differs:
+        raise ValueError(
+            "Standalone resume input file changed since the checkpoint was saved: "
+            f"saved={saved!r}, current={current!r}"
+        )
+
+
+__all__ = [
+    "CONSUMED_SEQUENCE_NAME",
+    "CONSUMED_GZIP_NAME",
+    "RESUME_METADATA_NAME",
+    "build_input_fingerprint",
+    "load_standalone_resume",
+    "parse_bool_setting",
+    "save_standalone_resume",
+    "validate_standalone_loader_config",
+]
+
+
+def _file_content_fingerprint(file_path: Path) -> dict[str, Any]:
+    if file_path.is_symlink():
+        raise ValueError(
+            f"Input fingerprint requires regular files without symlinks: {file_path}. Copy with symlinks expanded"
+        )
+    size = int(file_path.stat().st_size)
+    digest = hashlib.sha256()
+    digest.update(str(size).encode())
+    with regular_file(file_path) as stream:
+        if size <= _HASH_FULL_LIMIT_BYTES:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(chunk)
+        else:
+            offsets = {0, max(size - _HASH_CHUNK_BYTES, 0)}
+            for index in range(1, _HASH_SAMPLE_COUNT):
+                offsets.add((size * index) // _HASH_SAMPLE_COUNT)
+            for offset in sorted(offsets):
+                stream.seek(offset)
+                digest.update(stream.read(_HASH_CHUNK_BYTES))
+    return {"size_bytes": size, "sha256": digest.hexdigest()}
+
+
+def _fingerprint_identity(fingerprint: dict[str, Any]) -> dict[str, Any]:
+    """Fields that must match on resume; the mount path is informational only."""
+
+    return {key: value for key, value in fingerprint.items() if key != "path"}
 
 
 def validate_standalone_loader_config(
@@ -302,14 +1015,3 @@ def validate_standalone_loader_config(
             "Standalone resume loader configuration changed since the checkpoint "
             f"was saved: {mismatched}"
         )
-
-
-__all__ = [
-    "CONSUMED_SEQUENCE_NAME",
-    "RESUME_METADATA_NAME",
-    "build_input_fingerprint",
-    "load_standalone_resume",
-    "parse_bool_setting",
-    "save_standalone_resume",
-    "validate_standalone_loader_config",
-]

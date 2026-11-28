@@ -298,6 +298,8 @@ def test_dspark_forward_selects_target_positions_before_norm(apply_norm):
         draft_model=SimpleNamespace(extract_context_feature=lambda hidden: hidden[0]),
         block_size=2,
         opd_objective=None,
+        l1_loss_alpha=0.0,
+        lk_loss_alpha=0.0,
         _sample_anchor_positions=lambda *a, **kw: (torch.tensor([[0]]), torch.tensor([[True]])),
         _forward_anchor_blocks=lambda *a, **kw: torch.zeros(1, 1, 2, 2),
         _build_label_tensors=lambda **kw: (

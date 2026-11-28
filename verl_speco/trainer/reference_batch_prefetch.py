@@ -3,7 +3,7 @@
 """Scheduler-owned assignments, whole-batch CPU processes, ordered pinning.
 
 Only the dispatcher uses the prefetch Gloo group. Workers do not use Ray,
-TQ or scheduler state. Hidden references are released after CPU preparation.
+TQ or scheduler state. The caller controls when hidden references are released.
 Mooncake may initialize a device context required by its transport.
 Results use torch multiprocessing reducers, then the existing pin thread.
 """
@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import logging
 import os
+import math
 import threading
 import time
 from collections import deque
@@ -23,17 +24,26 @@ from typing import Any
 import torch
 import torch.multiprocessing as mp
 
-from verl_speco.trainer.standalone_prefetch import StandalonePrefetchIterator
+from verl_speco.trainer.standalone_prefetch import (
+    StandalonePrefetchIterator,
+    _host_budget_depth,
+    _prepared_host_bytes,
+    _reference_device_transfer_bytes,
+)
 from verl_speco.trainer.standalone_retry import retry_io
 
 _STORE: Any = None
 _OPTIONS: dict[str, Any] = {}
 _ATTEMPTS = 1
+_CLEANUP_AFTER_LOAD = True
+_MAX_BATCH_HOST_BYTES = 0
 logger = logging.getLogger(__name__)
 
 
-def _initialize_worker(config, options, attempts):
-    global _STORE, _OPTIONS, _ATTEMPTS
+def _initialize_worker(
+    config, options, attempts, cleanup_after_load=True, max_batch_host_bytes=0
+):
+    global _STORE, _OPTIONS, _ATTEMPTS, _CLEANUP_AFTER_LOAD, _MAX_BATCH_HOST_BYTES
     # This is a separate process: do not change the training process's threads.
     for name in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS"):
         os.environ.setdefault(name, "1")
@@ -43,6 +53,8 @@ def _initialize_worker(config, options, attempts):
     _STORE = ReferenceFeatureStore(config)
     _STORE.connect()
     _OPTIONS, _ATTEMPTS = dict(options), attempts
+    _CLEANUP_AFTER_LOAD = cleanup_after_load
+    _MAX_BATCH_HOST_BYTES = max_batch_host_bytes
 
 
 @torch.no_grad()
@@ -53,13 +65,69 @@ def _prepare_batch(entries):
         name="Reference batch preparation",
         attempts=_ATTEMPTS,
     )
+    if _MAX_BATCH_HOST_BYTES and _prepared_host_bytes(batch) > _MAX_BATCH_HOST_BYTES:
+        raise ValueError(
+            "Prepared reference batch exceeds consumer_prefetch_batch_bytes"
+        )
     # Do not delete inside the preparation retry: a retry must still be able to
-    # read all samples. Deletion retries are independent and nonfatal.
+    # read all samples. A failed release must not be acknowledged as complete.
     from verl_speco.trainer.standalone_sample_cleanup import cleanup_standalone_samples
 
-    cleanup_standalone_samples(_STORE, entries)
+    if _CLEANUP_AFTER_LOAD:
+        remaining = cleanup_standalone_samples(_STORE, entries)
+        if remaining:
+            raise RuntimeError(
+                f"Failed to release {len(remaining)} prepared references"
+            )
     batch["_speco_worker_finished_at"] = time.monotonic()
     return batch, time.perf_counter() - started
+
+
+def _node_frame_batch(
+    groups, *, binding, owner_rank, max_bytes, timeout, peer_processes=None
+):
+    from verl_speco.trainer.reference_shared_frame import (
+        serve_node_batches,
+        receive_node_batch,
+    )
+
+    if groups is not None:
+        if _CLEANUP_AFTER_LOAD:
+            raise RuntimeError(
+                "Node reference owner cannot release payloads during preparation"
+            )
+        if not isinstance(binding, dict) or binding.get("rank") != owner_rank:
+            raise ValueError("Node reference batch was not assigned to its owner")
+        return serve_node_batches(
+            groups,
+            binding=binding,
+            prepare=_prepare_batch,
+            max_bytes=max_bytes,
+            timeout=timeout,
+            peer_processes=peer_processes,
+        )
+    batch, seconds = receive_node_batch(
+        binding=binding,
+        owner_rank=owner_rank,
+        max_bytes=max_bytes,
+        timeout=timeout,
+        peer_processes=peer_processes,
+    )
+    # The collector measures IPC from its own local worker's completion.
+    batch["_speco_worker_finished_at"] = time.monotonic()
+    if _MAX_BATCH_HOST_BYTES and _prepared_host_bytes(batch) > _MAX_BATCH_HOST_BYTES:
+        raise ValueError(
+            "Received node reference batch exceeds consumer_prefetch_batch_bytes"
+        )
+    return batch, seconds
+
+
+def _node_worker_alive(pid):
+    try:
+        with open(f"/proc/{pid}/stat") as stream:
+            return stream.read().rpartition(") ")[2].split()[0] not in {"Z", "X"}
+    except (OSError, IndexError):
+        return False
 
 
 class ReferenceBatchPrefetchIterator(StandalonePrefetchIterator):
@@ -79,7 +147,12 @@ class ReferenceBatchPrefetchIterator(StandalonePrefetchIterator):
         prepare_options=None,
         close_timeout=180.0,
         pin_device=None,
+        defer_cleanup=False,
+        max_host_bytes=0,
+        max_batch_host_bytes=0,
+        node_ranks_per_host=0,
     ):
+        depth = _host_budget_depth(depth, max_host_bytes, max_batch_host_bytes)
         if workers < 1 or depth < 1:
             raise ValueError(
                 "Reference batch workers and prefetch depth must be positive"
@@ -88,7 +161,24 @@ class ReferenceBatchPrefetchIterator(StandalonePrefetchIterator):
             loader.store, "uses_transfer_queue", True
         ):
             raise ValueError("Process batch prefetch requires ray_reference input")
+        if node_ranks_per_host and (
+            depth != 1
+            or workers != 1
+            or not defer_cleanup
+            or not max_batch_host_bytes
+            or max_host_bytes < 3 * max_batch_host_bytes
+            or loader.node_ranks_per_host != node_ranks_per_host
+        ):
+            raise ValueError(
+                "Node reference owner requires one prefetch batch and worker, delayed cleanup and a 3-batch host budget"
+            )
+        self.node_ranks_per_host = node_ranks_per_host
+        self.node_frame_bytes = max_batch_host_bytes
+        self._pool_shutdown_thread = None
+        self._pool_shutdown_error = None
         self._pending: deque[Any] = deque()
+        self._active_result: Any = None
+        self.defer_cleanup = defer_cleanup
         self._assignments_done = False
         # Set defaults before spawn imports torch/numpy in the child. Existing
         # user overrides are preserved; only child torch intra-op is forced to 1.
@@ -101,9 +191,16 @@ class ReferenceBatchPrefetchIterator(StandalonePrefetchIterator):
                 loader.store.config,
                 dict(prepare_options or {}),
                 loader.io_retry_max_attempts,
+                not defer_cleanup,
+                max_batch_host_bytes,
             ),
         )
         try:
+            self._node_worker_pid = (
+                self._pool.apply_async(os.getpid).get(timeout=close_timeout)
+                if node_ranks_per_host
+                else 0
+            )
             super().__init__(
                 loader,
                 depth,
@@ -130,8 +227,28 @@ class ReferenceBatchPrefetchIterator(StandalonePrefetchIterator):
             raise
 
     def _run(self):
-        source = self.loader.iter_assignments()
+        source = None
         try:
+            source = self._open_source(self.loader.iter_assignments)
+            node_processes = {}
+            if self.node_ranks_per_host:
+                # Node-owner mode has exactly one CPU worker per training rank.
+                pids = [0] * (2 * self.loader.world_size)
+                pids[2 * self.loader.rank : 2 * self.loader.rank + 2] = [
+                    os.getpid(),
+                    self._node_worker_pid,
+                ]
+                pids = self._sync(pids)
+                owner = (
+                    self.loader.rank
+                    // self.node_ranks_per_host
+                    * self.node_ranks_per_host
+                )
+                node_processes = {
+                    rank: tuple(pids[2 * rank : 2 * rank + 2])
+                    for rank in range(owner, owner + self.node_ranks_per_host)
+                    if rank != self.loader.rank
+                }
             while True:
                 with self._condition:
                     self._condition.wait_for(
@@ -147,9 +264,34 @@ class ReferenceBatchPrefetchIterator(StandalonePrefetchIterator):
                     if assignment is None:
                         raise RuntimeError("Missing file batch assignment")
                     assignment.delivery_times["_worker_submitted_at"] = time.monotonic()
-                    result = self._pool.apply_async(
-                        _prepare_batch, (assignment.file_entries,)
-                    )
+                    if self.node_ranks_per_host:
+                        owner_rank = (
+                            self.loader.rank
+                            // self.node_ranks_per_host
+                            * self.node_ranks_per_host
+                        )
+                        binding = {
+                            "run_id": self.loader.store.run_id,
+                            "generation": 0,
+                            "batch_id": assignment.plan_id,
+                            "rank": self.loader.rank,
+                            "receipt_token": assignment.receipt_token,
+                        }
+                        result = self._pool.apply_async(
+                            _node_frame_batch,
+                            (assignment.node_file_entries,),
+                            {
+                                "binding": binding,
+                                "owner_rank": owner_rank,
+                                "max_bytes": self.node_frame_bytes,
+                                "timeout": self.close_timeout,
+                                "peer_processes": node_processes,
+                            },
+                        )
+                    else:
+                        result = self._pool.apply_async(
+                            _prepare_batch, (assignment.file_entries,)
+                        )
                 except StopIteration:
                     ended = True
                 except BaseException as exc:
@@ -195,12 +337,21 @@ class ReferenceBatchPrefetchIterator(StandalonePrefetchIterator):
                     if self.stop.is_set() or not self._pending:
                         return
                     assignment, result = self._pending.popleft()
+                    self._active_result = result
                 deadline = time.monotonic() + self.close_timeout
                 while not self.stop.is_set():
                     try:
                         prepared, seconds = result.get(timeout=0.1)
+                        self._active_result = None
                         break
                     except PoolTimeout:
+                        if self.node_ranks_per_host and (
+                            self._node_worker_pid is not None
+                            and not _node_worker_alive(self._node_worker_pid)
+                        ):
+                            raise RuntimeError(
+                                "Node reference batch worker exited"
+                            ) from None
                         if time.monotonic() >= deadline:
                             raise TimeoutError(
                                 "Reference batch worker exceeded preparation deadline"
@@ -225,12 +376,16 @@ class ReferenceBatchPrefetchIterator(StandalonePrefetchIterator):
                             assignment,
                             prepared_batch=prepared,
                             file_entries=None,
+                            node_file_entries=None,
                             batch_prepare_seconds=seconds,
-                            cleanup_after_load=True,
+                            cleanup_after_load=not self.defer_cleanup,
                             delivery_times=delivery_times,
                         )
                     )
                     self._condition.notify_all()
+                # AsyncResult and the collector otherwise retain the previous
+                # shared-memory payload after the pin thread has advanced.
+                del prepared, result
         except BaseException as exc:
             with self._condition:
                 self._error = exc
@@ -241,19 +396,193 @@ class ReferenceBatchPrefetchIterator(StandalonePrefetchIterator):
                 self._source_done = True
                 self._condition.notify_all()
 
-    def close(self):
-        self.stop.set()
-        with self._condition:
-            self._condition.notify_all()
-        self._collector.join(timeout=self.close_timeout)
+    @property
+    def has_running_work(self):
+        return (
+            super().has_running_work
+            or self._collector.is_alive()
+            or (
+                self._pool_shutdown_thread is not None
+                and self._pool_shutdown_thread.is_alive()
+            )
+            or (
+                self._pool_shutdown_thread is None
+                and bool(self._pending or self._active_result)
+            )
+        )
+
+    def close(self, *, timeout=None):
+        deadline = self._begin_close(timeout)
+        self._collector.join(timeout=max(0.0, deadline - time.monotonic()))
+        error = None
         try:
-            super().close()
+            super().close(timeout=max(1e-9, deadline - time.monotonic()))
+        except Exception as exc:
+            error = exc
+        if self._pool_shutdown_thread is None:
+
+            def shutdown_pool():
+                try:
+                    self._pool.terminate()
+                    self._pool.join()
+                except BaseException as exc:
+                    self._pool_shutdown_error = exc
+
+            self._pool_shutdown_thread = threading.Thread(
+                target=shutdown_pool, name="reference-pool-shutdown", daemon=True
+            )
+            self._pool_shutdown_thread.start()
+        self._pool_shutdown_thread.join(timeout=max(0.0, deadline - time.monotonic()))
+        if self._pool_shutdown_error is not None:
+            raise RuntimeError(
+                "Reference worker pool shutdown failed"
+            ) from self._pool_shutdown_error
+        if self.has_running_work:
+            raise RuntimeError(
+                "Reference batch prefetch did not stop before its shutdown deadline"
+            ) from error
+        self._pending.clear()
+        if error is not None:
+            raise error
+
+
+class ReferenceDevicePrefetchIterator:
+    """Copy at most one future reference batch on an independent device stream."""
+
+    def __init__(
+        self, source, *, device, backend, max_batch_bytes, close_timeout=180.0
+    ):
+        if (
+            type(max_batch_bytes) is not int
+            or max_batch_bytes <= 0
+            or isinstance(close_timeout, bool)
+            or not isinstance(close_timeout, (int, float))
+            or not math.isfinite(close_timeout)
+            or close_timeout <= 0
+        ):
+            raise ValueError(
+                "Device prefetch requires positive batch bytes and finite close timeout"
+            )
+        self.source, self.device, self.backend = source, device, backend
+        self.max_batch_bytes, self.close_timeout = max_batch_bytes, close_timeout
+        self._condition = threading.Condition()
+        self._close_lock = threading.Lock()
+        self._closed = False
+        self._stop = False
+        self._done = False
+        self._ready = None
+        self._error = None
+        self._thread = threading.Thread(
+            target=self._run, name="reference-device-prefetch", daemon=True
+        )
+        self._thread.start()
+
+    def _run(self):
+        try:
+            self.backend.set_device(
+                self.device.index if self.device.index is not None else 0
+            )
+            stream = self.backend.Stream()
+            while True:
+                with self._condition:
+                    self._condition.wait_for(lambda: self._stop or self._ready is None)
+                    if self._stop:
+                        return
+                try:
+                    batch = next(self.source)
+                except StopIteration:
+                    return
+                with self._condition:
+                    if self._stop:
+                        return
+                if batch.prepared_batch is None:
+                    raise RuntimeError(
+                        "Device prefetch requires a prepared reference batch"
+                    )
+                if (
+                    _reference_device_transfer_bytes(batch.prepared_batch)
+                    > self.max_batch_bytes
+                ):
+                    raise ValueError(
+                        "Reference batch exceeds consumer_device_batch_bytes"
+                    )
+                try:
+                    with self.backend.stream(stream):
+                        transferred = {
+                            key: value.to(self.device, non_blocking=True)
+                            if torch.is_tensor(value)
+                            else value
+                            for key, value in batch.prepared_batch.items()
+                        }
+                finally:
+                    # Also wait after a partial-copy failure: pinned input must
+                    # remain alive until all already-issued copies finish.
+                    stream.synchronize()
+                batch = replace(batch, prepared_batch=transferred)
+                with self._condition:
+                    if self._stop:
+                        return
+                    self._ready = batch
+                    self._condition.notify_all()
+                del batch, transferred
+        except BaseException as exc:
+            with self._condition:
+                self._error = exc
         finally:
-            # Cancel untrained tasks, including a blocked read or crashed worker.
-            # Files of already-loaded batches may have been deleted; other
-            # source files are left for regeneration or a later run.
-            self._pool.terminate()
-            self._pool.join()
-            self._pending.clear()
-        if self._collector.is_alive():
-            raise RuntimeError("Reference batch result collector did not stop")
+            with self._condition:
+                self._done = True
+                self._condition.notify_all()
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        with self._condition:
+            self._condition.wait_for(
+                lambda: self._ready is not None or self._done or self._stop
+            )
+            if self._stop:
+                raise StopIteration
+            if self._ready is not None:
+                batch, self._ready = self._ready, None
+                if self.device.type != "cpu":
+                    stream = self.backend.current_stream()
+                    for value in batch.prepared_batch.values():
+                        if torch.is_tensor(value):
+                            value.record_stream(stream)
+                self._condition.notify_all()
+                return batch
+            if self._error is not None:
+                raise self._error
+            raise StopIteration
+
+    @property
+    def has_running_work(self):
+        return self._thread.is_alive() or bool(
+            getattr(self.source, "has_running_work", False)
+        )
+
+    def close(self):
+        with self._close_lock:
+            if self._closed:
+                return
+            deadline = time.monotonic() + self.close_timeout
+            with self._condition:
+                self._stop = True
+                self._condition.notify_all()
+            error = None
+            try:
+                if isinstance(self.source, StandalonePrefetchIterator):
+                    self.source.close(timeout=max(1e-9, deadline - time.monotonic()))
+                else:
+                    self.source.close()
+            except Exception as exc:
+                error = exc
+            self._thread.join(timeout=max(0.0, deadline - time.monotonic()))
+            if self._thread.is_alive():
+                raise RuntimeError("Reference device prefetch did not stop") from error
+            with self._condition:
+                self._ready = None
+            if error is not None:
+                raise error
+            self._closed = True

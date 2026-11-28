@@ -23,7 +23,9 @@ class ReferenceFeatureStore:
 
     uses_transfer_queue = False
 
-    def __init__(self, config: Mapping[str, Any]):
+    def __init__(
+        self, config: Mapping[str, Any], *, hidden_states_store: Any | None = None
+    ):
         self.config = _plain_dict(config)
         lifetime = self.config.get("reference_lifetime", "temporary")
         if lifetime not in {"temporary", "persistent"}:
@@ -60,15 +62,19 @@ class ReferenceFeatureStore:
         )
         from verl_speco.producer.hidden_states_store import build_hidden_states_store
 
-        self.hidden_states_store = build_hidden_states_store(
-            self.config.get("hidden_states_store")
+        self.hidden_states_store = (
+            hidden_states_store
+            if hidden_states_store is not None
+            else build_hidden_states_store(self.config.get("hidden_states_store"))
         )
         if lifetime == "persistent" and self.hidden_states_store.backend == "file":
             self.hidden_states_store.wait_for_writer = False
 
     @classmethod
-    def from_config(cls, config: Any) -> ReferenceFeatureStore:
-        return cls(_plain_dict(config))
+    def from_config(
+        cls, config: Any, *, hidden_states_store: Any | None = None
+    ) -> ReferenceFeatureStore:
+        return cls(_plain_dict(config), hidden_states_store=hidden_states_store)
 
     def connect(self) -> None:
         self._connected = True
@@ -95,11 +101,21 @@ class ReferenceFeatureStore:
 
     def prepare_batch(self, entries: Sequence[ReadyEntry], **options) -> dict[str, Any]:
         """Materialize only scheduler-assigned file tags; never fetch TQ fields."""
-        import torch
-
         from verl_speco.trainer.standalone_batch_prepare import (
             prepare_standalone_cpu_batch,
         )
+
+        return prepare_standalone_cpu_batch(
+            [entry.tag for entry in entries],
+            self.reference_contract(entries),
+            hidden_states_store=getattr(self, "hidden_states_store", None),
+            read_timeout=float(self.config.get("io_timeout_seconds", 30)),
+            **options,
+        )
+
+    def reference_contract(self, entries: Sequence[ReadyEntry]):
+        """Validate assigned identities before either full or windowed reads."""
+        import torch
         from verl_speco.trainer.target_feature_replay import FeatureContract
         from verl_speco.transport.drafter_sample_protocol import (
             SampleMetadata,
@@ -131,13 +147,18 @@ class ReferenceFeatureStore:
                     )
         values = dict(entries[0].tag["feature_contract"])
         values["dtype"] = getattr(torch, values["dtype"].removeprefix("torch."))
-        return prepare_standalone_cpu_batch(
-            [entry.tag for entry in entries],
-            FeatureContract(**values),
-            hidden_states_store=getattr(self, "hidden_states_store", None),
-            read_timeout=float(self.config.get("io_timeout_seconds", 30)),
-            **options,
+        contract = FeatureContract(**values)
+        from verl_speco.producer.hidden_states_store import FileHiddenStatesStore
+        from verl_speco.trainer.standalone_batch_prepare import (
+            _validate_reference_contracts,
         )
+
+        _validate_reference_contracts(
+            [entry.tag for entry in entries],
+            contract,
+            getattr(self, "hidden_states_store", None) or FileHiddenStatesStore(),
+        )
+        return contract
 
     def close(self) -> None:
         """Compatibility with the standalone loop's existing cleanup path."""
