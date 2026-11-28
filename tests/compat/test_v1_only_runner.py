@@ -53,6 +53,10 @@ def upstream(monkeypatch):
     entry = _module(monkeypatch, "verl.trainer.main_ppo", TaskRunnerV1=object())
     monkeypatch.delitem(sys.modules, "verl.trainer.main_ppo_v0", raising=False)
     _module(monkeypatch, "ray", remote=Mock())
+    _module(monkeypatch, "torch", set_num_threads=Mock())
+    _module(monkeypatch, "verl.trainer.constants_ppo", available_physical_cores=lambda: 2)
+    _module(monkeypatch, "verl.utils.logging_utils", configure_verl_logging=Mock())
+    monkeypatch.setenv("OMP_NUM_THREADS", "1")
     monkeypatch.setattr(compat, "check_compatible_verl", Mock())
     return entry
 
@@ -114,6 +118,10 @@ def test_original_recipe_flags_reach_correct_runner(
             assert task_runner_class is adapter.SpecoTaskRunner
             task_runner_class().run(config)
             delegated.assert_called_once_with(config)
+            sys.modules["torch"].set_num_threads.assert_called_once_with(2)
+            sys.modules["verl.utils.logging_utils"].configure_verl_logging.assert_called_once_with()
+            with pytest.raises(RuntimeError, match="legacy runner"):
+                task_runner_class()._run_with_speco_trainer(config)
             SpecoV1Mixin._speco_validate_v1_training_config(config)
             assert SpecoV1Mixin._speco_online_enabled_from_config(config) == training
         else:
@@ -123,6 +131,31 @@ def test_original_recipe_flags_reach_correct_runner(
 
     upstream.run_ppo = run_ppo
     main.run(config)
+
+
+@pytest.mark.parametrize(
+    "backend,needing_training,specopd,expected",
+    [
+        ("vllm", True, False, "collect_hidden_states_from_old_logprob=true"),
+        ("sglang", True, False, "rollout.name=vllm"),
+        ("vllm", True, True, "SpecOPD on V1-only"),
+    ],
+)
+def test_legacy_recipe_errors_before_ray(upstream, backend, needing_training, specopd, expected):
+    config = OmegaConf.load(Path(main.__file__).parent / "config" / "speco_base.yaml")
+    config = OmegaConf.merge(config, {
+        "trainer": {"v1": {"trainer_mode": "sync"}, "use_v1": False},
+        "actor_rollout_ref": {"rollout": {"name": backend, "drafter": {
+            "enable": True, "enable_drafter_training": needing_training,
+            "training": {"specopd": {"enable": specopd}},
+        }}},
+        "algorithm": {},
+    })
+    upstream.run_ppo = Mock()
+    with pytest.raises(ValueError, match=expected):
+        main.run(config)
+    upstream.run_ppo.assert_not_called()
+    sys.modules["ray"].remote.assert_not_called()
 
 
 @pytest.mark.parametrize("api", ["0.8", "0.9"])
@@ -197,7 +230,7 @@ def test_v1_lifecycle_closes_driver_resources(upstream, monkeypatch, fail):
         ("0.11.0.dev0", True),
         ("0.11.0", True),
         ("0.12.0", True),
-        ("1.0.0", True),
+        ("1.0.0", False),
         ("0.9.1", False),
         ("invalid", False),
     ],
@@ -215,3 +248,10 @@ def test_v1_release_line_requires_matching_api(monkeypatch, version, accepted):
         assert not compat.resolve_verl_compatibility().supported
         with pytest.raises(RuntimeError, match="PPOTrainerSync"):
             compat.check_compatible_verl(strict=True)
+
+
+def test_unknown_major_is_not_accepted_via_stale_legacy_metadata(monkeypatch):
+    monkeypatch.delenv(compat.ALLOW_UNSUPPORTED_ENV, raising=False)
+    monkeypatch.setattr(compat, "_read_imported_verl_version", lambda: "1.0.0rc1")
+    monkeypatch.setattr(compat, "_read_distribution_vcs_info", lambda: (None, "release/v0.9.0"))
+    assert not compat.resolve_verl_compatibility().supported

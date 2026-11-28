@@ -178,6 +178,16 @@ class SpecoTaskRunner(_TaskRunnerBase):
     def run(self, config):
         from verl_speco.specopd_config import validate_specopd_config
 
+        if _VERL_TASK_RUNNER_API == "v1-only":
+            import torch
+            from verl.trainer.constants_ppo import available_physical_cores
+            from verl.utils.logging_utils import configure_verl_logging
+
+            threads = available_physical_cores()
+            os.environ["OMP_NUM_THREADS"] = str(threads)
+            torch.set_num_threads(threads)
+            configure_verl_logging()
+
         specopd = validate_specopd_config(config)
         if specopd.enable and _VERL_TASK_RUNNER_API != "0.9":
             raise RuntimeError(
@@ -313,6 +323,10 @@ class SpecoTaskRunner(_TaskRunnerBase):
                     logger.info("Closed SPECO V1 TransferQueue")
 
     def _run_with_speco_trainer(self, config):
+        if _VERL_TASK_RUNNER_API not in {"0.8", "0.9"}:
+            raise RuntimeError(
+                "The legacy trainer requires a verl 0.8 or 0.9 legacy runner"
+            )
         from verl.utils.dataset.rl_dataset import collate_fn
 
         from verl_speco.trainer.speco_ray_trainer import SpecoRayPPOTrainer

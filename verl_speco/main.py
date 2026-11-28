@@ -348,11 +348,24 @@ def run(config) -> None:
     bypass = should_bypass_speco(config)
     if has_only_v1_runner(main_ppo):
         from omegaconf import OmegaConf
+        from verl_speco.specopd_config import spec_opd_enabled, specopd_training_config
+
+        if spec_opd_enabled(specopd_training_config(config)):
+            raise ValueError(
+                "SpecOPD on V1-only verl is unsupported; use release/v0.9.0 "
+                "with trainer.use_v1=true and trainer.v1.trainer_mode=sync"
+            )
+        if not bypass:
+            from verl_speco.trainer.v1.training_config import (
+                validate_v1_training_config,
+            )
+
+            validate_v1_training_config(config)
 
         # Older recipes explicitly disable both. run_ppo reads the queue flag
         # while building the Ray environment, before the task runner starts.
-        if not _config_get(config, "trainer", "use_v1") or not _config_get(
-            config, "transfer_queue", "enable"
+        if _config_get(config, "trainer", "use_v1") is False or (
+            _config_get(config, "transfer_queue", "enable") is False
         ):
             logging.getLogger(__name__).warning(
                 "Detected V1-only verl; enabling trainer.use_v1 and transfer_queue.enable before Ray initialization"

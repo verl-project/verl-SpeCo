@@ -34,7 +34,7 @@ from packaging.version import InvalidVersion, Version
 SUPPORTED_VERL_VERSION = "0.8.0"
 SUPPORTED_VERL_BRANCH = "release/v0.8.0"
 V1_MIN_VERSION = Version("0.10")
-V1_VERSION_RANGE = f">={V1_MIN_VERSION}"
+V1_VERSION_RANGE = f">={V1_MIN_VERSION},<1"
 SUPPORTED_VERL_VERSIONS = ("0.8.0", "0.9.0", V1_VERSION_RANGE)
 SUPPORTED_VERL_BRANCHES = ("release/v0.8.0", "release/v0.9.0")
 SUPPORTED_VERL_RELEASES = {"0.8.0": "release/v0.8.0", "0.9.0": "release/v0.9.0"}
@@ -232,7 +232,7 @@ def _version_matches_release(version: str | None, allowed_version: str) -> bool:
     try:
         parsed = Version(version)
         if allowed_version == V1_VERSION_RANGE:
-            return Version(parsed.base_version) >= V1_MIN_VERSION
+            return parsed.major == 0 and Version(parsed.base_version) >= V1_MIN_VERSION
         return parsed.base_version == Version(allowed_version).base_version
     except InvalidVersion:
         return False
@@ -278,6 +278,12 @@ def resolve_verl_compatibility(
     release_version = matched_branch_version or matched_version
     if matched_version == V1_VERSION_RANGE:
         release_version = matched_version
+    elif version is not None:
+        try:
+            if Version(version).major >= 1:
+                release_version = None
+        except InvalidVersion:
+            pass
     missing_api = (
         _missing_required_api(release_version) if release_version is not None else ()
     )
@@ -289,7 +295,7 @@ def resolve_verl_compatibility(
                 commit_id,
                 requested_revision,
                 True,
-                "matched verl >=0.10 V1 API contract",
+                f"matched verl {V1_VERSION_RANGE} V1 API contract",
             )
         release_branch = SUPPORTED_VERL_RELEASES[release_version]
         reason = f"matched {release_branch} version/API contract"
@@ -340,7 +346,7 @@ def check_compatible_verl(strict: bool | None = None) -> VerlCompatibility:
         return result
 
     message = (
-        "SPECO requires verl release/v0.8.0, release/v0.9.0, or verl >=0.10 with the V1 API; "
+        "SPECO requires verl release/v0.8.0, release/v0.9.0, or verl >=0.10,<1 with the V1 API; "
         f"found version={result.version!r}, requested_revision={result.requested_revision!r}, "
         f"commit_id={result.commit_id!r}: {result.reason}. "
         f"Set {STRICT_COMPAT_ENV}=1 to fail closed."
