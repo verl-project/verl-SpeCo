@@ -21,7 +21,7 @@ from typing import Any
 # aux-plus-final layout. Domino and DFlash2 are DFlash variants, so they share
 # the layout.
 DFLASH_FAMILY_ALGORITHMS = frozenset(
-    {"DFLASH", "DFLASH2", "DSPARK", "DSV4_DSPARK", "DOMINO"}
+    {"DFLASH", "DFLASH2", "DSPARK", "DSV4_DSPARK", "DOMINO", "LILICORR"}
 )
 
 
@@ -148,6 +148,10 @@ def resolve_drafter_hidden_states_layout(algorithm: Any, training_cfg: Any) -> s
         and float(_get_nested(training_cfg, ("dflash_lk_loss_alpha",), 0.0) or 0.0) > 0
     ):
         return "dflash_aux_plus_last"
+    if algorithm == "LILICORR":
+        # The lattice head reads the target logits' argmax for the ground truth
+        # and the distractor cost, so it always needs the final hidden layer.
+        return "dflash_aux_plus_last"
     return "dflash_aux"
 
 
@@ -166,6 +170,8 @@ def _is_dflash_config(drafter_cfg: Any, model_configs: tuple[Any, ...]) -> bool:
             "DSV4DSparkDraftModel",
             "DominoDraftModel",
             "Qwen3DominoModel",
+            "LiLiCorrDraftModel",
+            "LiLiCorrSpeculator",
         }
         for config in model_configs
         for architecture in _config_architectures(config)

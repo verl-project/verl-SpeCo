@@ -18,7 +18,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 
 _DECODER_INDEX_ALGORITHMS = frozenset(
-    {"DFLASH", "DFLASH2", "DSPARK", "DSV4_DSPARK", "DOMINO"}
+    {"DFLASH", "DFLASH2", "DSPARK", "DSV4_DSPARK", "DOMINO", "LILICORR"}
 )
 
 

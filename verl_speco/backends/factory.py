@@ -36,6 +36,7 @@ SUPPORTED_DRAFTER_ALGORITHMS = (
     "DSV4_DSPARK",
     "DOMINO",
     "PEAGLE",
+    "LILICORR",
 )
 
 
@@ -85,6 +86,12 @@ def build_trainer_backend(config, model_config) -> Any:
         from verl_speco.backends.peagle_trainer_backend import PEagleTrainerBackend
 
         return PEagleTrainerBackend(config, model_config)
+    if algorithm == "LILICORR":
+        from verl_speco.backends.lilicorr_trainer_backend import (
+            LiLiCorrTrainerBackend,
+        )
+
+        return LiLiCorrTrainerBackend(config, model_config)
 
     raise ValueError(
         f"Unsupported drafter algorithm {raw_algorithm!r}; supported algorithms are "

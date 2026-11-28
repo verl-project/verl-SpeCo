@@ -324,6 +324,12 @@ class DFlashTrainingModel(nn.Module):
 
     _no_split_modules = ["DFlashDecoderLayer"]
 
+    # Optional block-level auxiliary objective. Subclasses whose head needs whole
+    # blocks (rather than the flattened supervised rows ``_auxiliary_loss`` sees)
+    # set this to a callable and get the full block layout below. Returns
+    # ``(loss_or_None, metrics)``.
+    _block_lattice_loss = None
+
     def __init__(
         self,
         draft_model: DFlashDraftModel,
@@ -979,6 +985,26 @@ class DFlashTrainingModel(nn.Module):
                 lk_loss = local_lk_sum / local_lk_den.clamp(min=1e-6)
         loss = (ce_loss * self.ce_loss_alpha) + (lk_loss * self.lk_loss_alpha)
 
+        lattice_metrics: dict[str, torch.Tensor] = {}
+        if self._block_lattice_loss is not None:
+            lattice_loss, lattice_metrics = self._block_lattice_loss(
+                draft_hidden=draft_hidden,
+                lm_head_weight=lm_head_weight,
+                target_ids=target_ids,
+                aligned_target_hidden=aligned_target_hidden,
+                base_loss_mask=base_loss_mask,
+                original_loss_mask=original_loss_mask,
+                valid_label_mask=valid_label_mask,
+                block_keep_mask=block_keep_mask,
+                anchor_positions=anchor_positions,
+                context_feature=context_feature,
+                document_ids=document_ids,
+                seq_len=seq_len,
+                target_hidden_is_raw=target_hidden_is_raw,
+            )
+            if lattice_loss is not None:
+                loss = loss + lattice_loss
+
         if self.opd_objective is not None and self.opd_objective.loss_type == "e2e_tv":
             opd_logits = (
                 active_logits
@@ -1215,6 +1241,7 @@ class DFlashTrainingModel(nn.Module):
             diagnostics.update(auxiliary_metrics)
             diagnostics.update(vat_metrics)
             diagnostics.update(opd_metrics)
+            diagnostics.update(lattice_metrics)
             if self.vat_objective is not None:
                 diagnostics["vat/ce_loss"] = ce_loss.detach()
 
