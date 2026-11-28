@@ -119,7 +119,12 @@ REQUIRED_VERL_API_BY_RELEASE: dict[str, tuple[tuple[str, tuple[str, ...]], ...]]
         ("verl.trainer.main_ppo", ("TaskRunnerV1", "run_ppo")),
         (
             "verl.trainer.ppo.v1",
-            ("PPOTrainerSync", "PPOTrainerColocateAsync", "PPOTrainerSeparateAsync", "AgentLoopManagerTQ"),
+            (
+                "PPOTrainerSync",
+                "PPOTrainerColocateAsync",
+                "PPOTrainerSeparateAsync",
+                "AgentLoopManagerTQ",
+            ),
         ),
         ("verl.utils.config", ("omega_conf_to_dataclass", "validate_config")),
     ),
@@ -280,7 +285,11 @@ def resolve_verl_compatibility(
     if release_version is not None and not missing_api:
         if release_version == V1_VERSION_RANGE:
             return VerlCompatibility(
-                version, commit_id, requested_revision, True, "matched verl >=0.10 V1 API contract"
+                version,
+                commit_id,
+                requested_revision,
+                True,
+                "matched verl >=0.10 V1 API contract",
             )
         release_branch = SUPPORTED_VERL_RELEASES[release_version]
         reason = f"matched {release_branch} version/API contract"

@@ -2362,7 +2362,10 @@ class SpecoV1Mixin(V1BubbleMixin):
                         # V1-only verl calls these APIs directly.
                         import transfer_queue as tq
 
-                        supported = all(callable(getattr(tq, op, None)) for op in ("save_checkpoint", "load_checkpoint"))
+                        supported = all(
+                            callable(getattr(tq, op, None))
+                            for op in ("save_checkpoint", "load_checkpoint")
+                        )
                     else:
                         supported = check()
                     if not supported:

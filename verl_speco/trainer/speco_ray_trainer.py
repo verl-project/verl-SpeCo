@@ -144,11 +144,12 @@ except ModuleNotFoundError as exc:
     if exc.name != "verl.trainer.ppo.ray_trainer":
         raise
 
-    class RayPPOTrainer:
+    class RayPPOTrainer:  # type: ignore[no-redef]
         """V1 binds shared hook methods without constructing a legacy trainer."""
 
         def __init__(self, *args, **kwargs):
             raise RuntimeError("The installed verl only supports the V1 training path")
+
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
