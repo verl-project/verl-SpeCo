@@ -6045,7 +6045,9 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             mapping = worker_group._query_dispatch_info("drafter_owner_route")
             if isinstance(dispatch_info, dict):
                 dispatch_info["drafter_owner_route"] = mapping
-        return mapping
+        if mapping is None:
+            return None
+        return [int(getattr(info, "dp_rank", info)) for info in mapping]
 
     def _speco_owner_route_collect_mask(self):
         worker_group = self.drafter_wg
@@ -6059,7 +6061,9 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             collect_mask = worker_group._query_collect_info("drafter_owner_route")
             if isinstance(collect_info, dict):
                 collect_info["drafter_owner_route"] = collect_mask
-        return collect_mask
+        if collect_mask is None:
+            return None
+        return [bool(getattr(info, "is_collect", info)) for info in collect_mask]
 
     def _speco_dispatch_bucket_count(self) -> int | None:
         mapping = self._speco_owner_route_mapping()
@@ -6225,7 +6229,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             return payload, source_step, 1
 
         target_sync_bucket_count = (
-            max(int(dp_rank) for dp_rank in target_sync_mapping) + 1
+            max(int(getattr(info, "dp_rank", info)) for info in target_sync_mapping) + 1
         )
         payload_buckets = [payload for _ in range(target_sync_bucket_count)]
         global_step_buckets = [source_step for _ in range(target_sync_bucket_count)]

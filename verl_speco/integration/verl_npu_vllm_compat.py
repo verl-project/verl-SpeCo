@@ -212,6 +212,20 @@ def install_verl_npu_vllm_import_compat(
     return True
 
 
+def install_npu_megatron_import_compat() -> bool:
+    """Initialize the installed NPU adapter before unpickling Megatron tensors."""
+    try:
+        nvrx = importlib.import_module("nvidia_resiliency_ext")
+    except ImportError:
+        return False
+    if hasattr(nvrx, "__version__") or not _module_available("megatron_adaptor"):
+        return False
+    # Adapted NVRx builds rely on MegatronAdaptor's import-time compatibility.
+    # Its initializer also prepares the Megatron symbols carried by Ray payloads.
+    importlib.import_module("megatron_adaptor")
+    return True
+
+
 def install_verl_npu_vllm_worker_process_compat() -> None:
     """Install the import guard before a Ray worker deserializes its actor.
 

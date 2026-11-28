@@ -515,3 +515,28 @@ def test_fsdp_training_output_release_preserves_forward_only(monkeypatch) -> Non
     _, inference_output = engine.forward_step(None, None, True)
     assert "model_output" not in training_output
     assert inference_output["model_output"] == {"log_probs": "tensor"}
+
+@pytest.mark.parametrize("native_version", [None, "0.6.0"])
+def test_npu_megatron_adapter_prepares_namespace_nvrx(monkeypatch, native_version):
+    nvrx = types.ModuleType("nvidia_resiliency_ext")
+    if native_version is not None:
+        nvrx.__version__ = native_version
+    calls = []
+    monkeypatch.setattr(compat, "_module_available", lambda name: name == "megatron_adaptor")
+    def importer(name):
+        calls.append(name)
+        if name == "nvidia_resiliency_ext":
+            return nvrx
+        assert name == "megatron_adaptor"
+        nvrx.__version__ = "adapter-owned-version"
+    monkeypatch.setattr(compat.importlib, "import_module", importer)
+    assert compat.install_npu_megatron_import_compat() is (native_version is None)
+    assert nvrx.__version__ == (native_version or "adapter-owned-version")
+    assert ("megatron_adaptor" in calls) is (native_version is None)
+
+
+def test_npu_megatron_adapter_skips_absent_optional_dependency(monkeypatch):
+    def missing(name):
+        raise ModuleNotFoundError(name)
+    monkeypatch.setattr(compat.importlib, "import_module", missing)
+    assert compat.install_npu_megatron_import_compat() is False

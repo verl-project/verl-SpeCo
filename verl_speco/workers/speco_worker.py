@@ -400,7 +400,10 @@ def _dispatch_lazy_compute(mesh_name, worker_group, *args, **kwargs):
         )
         assert len(worker_group._dispatch_info[mesh_name]) == worker_group.world_size
 
-    dp_rank_mapping = worker_group._dispatch_info[mesh_name]
+    dp_rank_mapping = [
+        int(getattr(info, "dp_rank", info))
+        for info in worker_group._dispatch_info[mesh_name]
+    ]
     dp_size = max(dp_rank_mapping) + 1
     return _dispatch_nd_compute(dp_rank_mapping, dp_size, worker_group, *args, **kwargs)
 
@@ -417,9 +420,11 @@ def _collect_lazy_compute(mesh_name, worker_group, *args, **kwargs):
         )
         assert len(worker_group._collect_info[mesh_name]) == worker_group.world_size
 
-    return _collect_nd_compute(
-        worker_group._collect_info[mesh_name], worker_group, *args, **kwargs
-    )
+    collect_mask = [
+        bool(getattr(info, "is_collect", info))
+        for info in worker_group._collect_info[mesh_name]
+    ]
+    return _collect_nd_compute(collect_mask, worker_group, *args, **kwargs)
 
 
 def make_nd_compute_dispatch_fn(mesh_name):
@@ -522,6 +527,12 @@ class SpecoWorker(Worker):
                 "SpecoWorker requires an explicit device_name from the trainer initialization path"
             )
         self.device_name = str(device_name).lower()
+        if self.device_name == "npu":
+            from verl_speco.integration.verl_npu_vllm_compat import (
+                install_npu_megatron_import_compat,
+            )
+
+            install_npu_megatron_import_compat()
         self.trainer: Any = None
         self.feature_writer: Optional[TorchShardFeatureStore] = None
         self.feature_writer_path: Optional[str] = None
