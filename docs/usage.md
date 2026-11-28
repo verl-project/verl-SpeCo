@@ -1,6 +1,6 @@
 # verl-SpeCo Usage Guide
 
-Last updated: 11/19/2026
+Last updated: 11/28/2026
 
 Use the version and runtime guidance below to install SpeCo and run online co-training or standalone drafter training. For the project overview and architecture, see the [README](../README.md).
 
@@ -13,7 +13,7 @@ Install the upstream `verl` release branch specified in
 [`verl_speco/config/speco_base.yaml`](.././verl_speco/config/speco_base.yaml).
 By default, unsupported `verl` versions produce a warning. Set
 `VERL_SPECO_STRICT_VERL=1` to fail closed when the importable `verl` does not
-match either the release/v0.8.0 or release/v0.9.0 API contract. The repository
+match the release/v0.8.0, release/v0.9.0, or V1-only API contract described below. The repository
 keeps release/v0.8.0 as the default and CI baseline; release/v0.9.0 is an
 additive compatibility path used by native vLLM MRV2 deployments.
 
@@ -216,6 +216,28 @@ DSpark checkpoint in `drafter.model_path`. Keep `rollout.spec_steps=1` and
 `training.collect_hidden_states_from_old_logprob=true` as in the vLLM example.
 
 ### verl V1 runner (Phase 1)
+
+On V1-only verl, SpeCo enables the V1 runner and TransferQueue before Ray
+starts, including when the original recipe explicitly disables them. The
+driver preserves the chosen rollout backend and drafter settings. For online
+training, use `--config-name=speco_v1_trainer` with vLLM, or explicitly set
+`actor_rollout_ref.rollout.drafter.training.collect_hidden_states_from_old_logprob=true`
+in a compatible recipe. Disable SGL hidden-state collection and old-logprob
+bypass. These collection requirements apply only to online drafter training.
+SpecOPD requires the 0.9 V1 sync trainer.
+
+On NPU, the vLLM import guard checks the installed verl patch for the legacy
+`FusedMoE` symbol so downstream trainer shims do not select the patch. Online
+drafter workers initialize MegatronAdaptor before receiving training RPCs when
+the installed adapter provides its NVRx compatibility patch and NVRx is missing
+its version attribute. This includes FSDP2 actors that pass Megatron objects.
+
+The V1 API probe covers 0.x release lines starting at 0.10 (including dev and
+RC builds). The tested baseline is verl
+`499cbe6d3a741de605c6aaf495c4bd13c1ac1fff` with TransferQueue 0.1.12.
+Hardware coverage is synchronous DSpark on vLLM with a fixed or online
+drafter. Async modes, checkpoint restore, and later releases require separate
+validation. Unknown major versions follow the standard warning/strict policy.
 
 On `release/v0.9.0`, SPECO can now enter verl's native V1
 `TransferQueue` trainer with `trainer.use_v1=true`. Fixed-drafter serving and

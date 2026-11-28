@@ -34,7 +34,6 @@ import torch
 from omegaconf import open_dict
 from verl import DataProto
 from verl.single_controller.ray import RayClassWithInitArgs
-from verl.trainer.ppo.ray_trainer import RayPPOTrainer
 from verl.trainer.ppo.utils import Role
 from verl.utils import tensordict_utils as tu
 from verl.workers.utils.padding import left_right_2_no_padding, no_padding_2_padding
@@ -138,6 +137,19 @@ from verl_speco.workers import SpecoWorker
 
 
 from verl_speco.integration.verify_trace import TRACE_KEY
+
+try:
+    from verl.trainer.ppo.ray_trainer import RayPPOTrainer
+except ModuleNotFoundError as exc:
+    if exc.name != "verl.trainer.ppo.ray_trainer":
+        raise
+
+    class RayPPOTrainer:  # type: ignore[no-redef]
+        """V1 binds shared hook methods without constructing a legacy trainer."""
+
+        def __init__(self, *args, **kwargs):
+            raise RuntimeError("The installed verl only supports the V1 training path")
+
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -6034,7 +6046,9 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             mapping = worker_group._query_dispatch_info("drafter_owner_route")
             if isinstance(dispatch_info, dict):
                 dispatch_info["drafter_owner_route"] = mapping
-        return mapping
+        if mapping is None:
+            return None
+        return [int(getattr(info, "dp_rank", info)) for info in mapping]
 
     def _speco_owner_route_collect_mask(self):
         worker_group = self.drafter_wg
@@ -6048,7 +6062,9 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             collect_mask = worker_group._query_collect_info("drafter_owner_route")
             if isinstance(collect_info, dict):
                 collect_info["drafter_owner_route"] = collect_mask
-        return collect_mask
+        if collect_mask is None:
+            return None
+        return [bool(getattr(info, "is_collect", info)) for info in collect_mask]
 
     def _speco_dispatch_bucket_count(self) -> int | None:
         mapping = self._speco_owner_route_mapping()
@@ -6214,7 +6230,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             return payload, source_step, 1
 
         target_sync_bucket_count = (
-            max(int(dp_rank) for dp_rank in target_sync_mapping) + 1
+            max(int(getattr(info, "dp_rank", info)) for info in target_sync_mapping) + 1
         )
         payload_buckets = [payload for _ in range(target_sync_bucket_count)]
         global_step_buckets = [source_step for _ in range(target_sync_bucket_count)]

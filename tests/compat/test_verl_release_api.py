@@ -205,6 +205,12 @@ def _class_method_names(source: str, class_name: str) -> set[str]:
 def _release_for_upstream_root(root: Path) -> str:
     if (root / "verl" / "trainer" / "main_ppo_v0.py").is_file():
         return "0.9.0"
+    main = _module_file(root, "verl.trainer.main_ppo").read_text(encoding="utf-8")
+    exports = _defined_names(main)
+    if "TaskRunnerV1" in exports and "TaskRunner" not in exports:
+        from verl_speco.integration.compat import V1_VERSION_RANGE
+
+        return V1_VERSION_RANGE
     return "0.8.0"
 
 
@@ -213,10 +219,18 @@ def test_supported_release_modules_and_symbols_are_present() -> None:
     if not upstream_root:
         pytest.skip("set VERL_SPECO_UPSTREAM_ROOT to check a supported verl API")
 
+    from verl_speco.integration.compat import V1_VERSION_RANGE
+
     root = _upstream_repo_root(upstream_root)
     release = _release_for_upstream_root(root)
     missing: list[str] = []
-    for module_name, symbols in REQUIRED_MODULES_BY_RELEASE[release].items():
+    if release == V1_VERSION_RANGE:
+        from verl_speco.integration.compat import REQUIRED_VERL_API_BY_RELEASE
+
+        required = REQUIRED_VERL_API_BY_RELEASE[release]
+    else:
+        required = REQUIRED_MODULES_BY_RELEASE[release].items()
+    for module_name, symbols in required:
         try:
             names = _defined_names(
                 _module_file(root, module_name).read_text(encoding="utf-8")
@@ -229,6 +243,14 @@ def test_supported_release_modules_and_symbols_are_present() -> None:
                 missing.append(f"{module_name}.{symbol}")
 
     class_methods = REQUIRED_CLASS_METHODS_V090 if release == "0.9.0" else {}
+    if release == V1_VERSION_RANGE:
+        class_methods = {
+            ("verl.trainer.ppo.v1.trainer_base", "PPOTrainer"): (
+                "init", "_setup", "_init_resource_pool_mgr", "fit", "close_dataloaders",
+                "get_llm_client", "get_teacher_client", "get_reward_handles",
+                "_compute_old_log_prob", "_update_actor", "_compute_metrics", "_save_checkpoint",
+            ),
+        }
     for (module_name, class_name), methods in class_methods.items():
         try:
             source = _module_file(root, module_name).read_text(encoding="utf-8")
@@ -262,7 +284,7 @@ def test_supported_release_version_variants_are_accepted(
 
 
 @pytest.mark.parametrize("version", (None, "0.7.0", "0.10.0", "0.9.1.dev0"))
-def test_other_verl_versions_are_rejected(version: str | None) -> None:
+def test_other_versions_do_not_select_legacy_contracts(version: str | None) -> None:
     from verl_speco.integration.compat import _version_matches_release
 
     assert not any(

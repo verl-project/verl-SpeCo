@@ -20,6 +20,8 @@ import importlib
 import importlib.util
 import inspect
 import logging
+from importlib import resources
+from pathlib import Path
 import sys
 import time
 from collections.abc import Callable, Iterator
@@ -89,6 +91,20 @@ def _uses_verl_v090_runner() -> bool:
     """Identify the moved legacy runner without importing accelerator modules."""
 
     return _module_available("verl.trainer.main_ppo_v0")
+
+
+def _needs_legacy_fused_moe_guard() -> bool:
+    """Read the installed patch before importing verl.utils.vllm executes it.
+
+    Backports can retain either trainer layout. Only patches referencing the
+    removed vLLM symbol need the temporary exports below. If source is not
+    available, retain the legacy guard for compatibility with packaged builds.
+    """
+    try:
+        patch = resources.files("verl") / "utils" / "vllm" / "npu_vllm_patch.py"
+        return "FusedMoE" in patch.read_text(encoding="utf-8")
+    except (OSError, TypeError, ModuleNotFoundError):
+        return True
 
 
 def _install_verl_v080_npu_vllm_import_compat(
@@ -179,6 +195,8 @@ def install_verl_npu_vllm_import_compat(
         return False
     if not _module_available("torch_npu"):
         return False
+    if not _needs_legacy_fused_moe_guard():
+        return False
 
     runner_api = "0.9" if _uses_verl_v090_runner() else "0.8"
     if runner_api == "0.9":
@@ -198,6 +216,41 @@ def install_verl_npu_vllm_import_compat(
     logger.warning(
         "Applied verl NPU vLLM import compatibility for legacy runner API %s",
         runner_api,
+    )
+    return True
+
+
+def install_npu_megatron_import_compat() -> bool:
+    """Initialize the installed NPU adapter before unpickling Megatron tensors."""
+    spec = importlib.util.find_spec("megatron_adaptor")
+    # Looking up the dotted module with find_spec would execute the adapter's
+    # top-level initializer, which patches Megatron globally in this process.
+    if spec is None or not any(
+        (Path(root) / "patches" / "megatron" / "nvrx_compat.py").is_file()
+        for root in spec.submodule_search_locations or ()
+    ):
+        return False
+    try:
+        nvrx = importlib.import_module("nvidia_resiliency_ext")
+    except ModuleNotFoundError as exc:
+        if exc.name == "nvidia_resiliency_ext":
+            return False
+        raise
+    if hasattr(nvrx, "__version__"):
+        return False
+    try:
+        importlib.import_module("megatron_adaptor")
+    except Exception as exc:
+        raise RuntimeError(
+            "Could not initialize MegatronAdaptor for NPU online drafter training "
+            "before deserializing Megatron payloads"
+        ) from exc
+    if not hasattr(nvrx, "__version__"):
+        raise RuntimeError(
+            "MegatronAdaptor did not initialize the NVRx version for the NPU drafter"
+        )
+    logger.info(
+        "Initialized MegatronAdaptor NVRx compatibility for online drafter training"
     )
     return True
 
