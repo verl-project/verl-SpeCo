@@ -22,18 +22,19 @@ import pytest
 from verl_speco.integration import verl_npu_vllm_compat as compat
 
 
-@pytest.fixture(autouse=True)
-def _legacy_layout(monkeypatch):
-    monkeypatch.setattr(compat, "_uses_v1_only_trainer", lambda: False)
+@pytest.fixture
+def _legacy_patch(monkeypatch):
+    monkeypatch.setattr(compat, "_needs_legacy_fused_moe_guard", lambda: True)
 
 
 def test_v1_only_leaves_native_npu_patch_to_verl(monkeypatch):
     monkeypatch.setitem(sys.modules, "torch_npu", types.ModuleType("torch_npu"))
     monkeypatch.setattr(compat, "_IMPORT_COMPAT_APPLIED", False)
-    monkeypatch.setattr(compat, "_uses_v1_only_trainer", lambda: True)
+    monkeypatch.setattr(compat, "_needs_legacy_fused_moe_guard", lambda: False)
     assert compat.install_verl_npu_vllm_import_compat(pytest.fail) is False
 
 
+@pytest.mark.usefixtures("_legacy_patch")
 def test_v080_npu_patch_temporarily_adds_factory_weight_loader(monkeypatch) -> None:
     vllm = types.ModuleType("vllm")
     vllm.__version__ = "0.23.0"
@@ -62,6 +63,7 @@ def test_v080_npu_patch_temporarily_adds_factory_weight_loader(monkeypatch) -> N
     assert compat._IMPORT_COMPAT_APPLIED is True
 
 
+@pytest.mark.usefixtures("_legacy_patch")
 def test_unrecognized_runner_layout_falls_back_to_safe_factory_import(monkeypatch) -> None:
     vllm = types.ModuleType("vllm")
     # CI's release/0.9 packaging keeps main_ppo.py, so the old layout probe
@@ -104,6 +106,7 @@ def test_worker_process_setup_hook_installs_import_compat(monkeypatch) -> None:
     assert calls == ["compat"]
 
 
+@pytest.mark.usefixtures("_legacy_patch")
 def test_v090_npu_patch_temporarily_adds_factory_weight_loader(monkeypatch) -> None:
     def fused_moe_factory(*args, **kwargs):
         return args, kwargs
@@ -142,6 +145,7 @@ def test_v090_npu_patch_temporarily_adds_factory_weight_loader(monkeypatch) -> N
     assert compat._IMPORT_COMPAT_APPLIED is True
 
 
+@pytest.mark.usefixtures("_legacy_patch")
 def test_v090_npu_patch_handles_package_exported_factory(monkeypatch) -> None:
     def fused_moe_factory(*args, **kwargs):
         return args, kwargs
@@ -166,6 +170,7 @@ def test_v090_npu_patch_handles_package_exported_factory(monkeypatch) -> None:
     assert not hasattr(fused_moe_factory, "weight_loader")
 
 
+@pytest.mark.usefixtures("_legacy_patch")
 def test_v090_npu_patch_skips_removed_fused_moe_factory(monkeypatch) -> None:
     fused_moe_package = types.ModuleType(compat._VLLM_FUSED_MOE_PACKAGE)
     fused_moe_layer = types.ModuleType(compat._VLLM_FUSED_MOE_LAYER_MODULE)
@@ -188,6 +193,7 @@ def test_v090_npu_patch_skips_removed_fused_moe_factory(monkeypatch) -> None:
     assert compat._IMPORT_COMPAT_APPLIED is True
 
 
+@pytest.mark.usefixtures("_legacy_patch")
 def test_v090_npu_patch_removes_temporary_export_after_import_failure(
     monkeypatch,
 ) -> None:
@@ -212,6 +218,7 @@ def test_v090_npu_patch_removes_temporary_export_after_import_failure(
     assert compat._IMPORT_COMPAT_APPLIED is False
 
 
+@pytest.mark.usefixtures("_legacy_patch")
 def test_v090_npu_patch_preserves_existing_fused_moe_export(monkeypatch) -> None:
     class LegacyFusedMoE:
         pass
@@ -516,27 +523,67 @@ def test_fsdp_training_output_release_preserves_forward_only(monkeypatch) -> Non
     assert "model_output" not in training_output
     assert inference_output["model_output"] == {"log_probs": "tensor"}
 
+
+@pytest.mark.parametrize("references_legacy_symbol", [False, True])
+def test_probe_uses_installed_patch_independently_of_trainer_layout(tmp_path, monkeypatch, references_legacy_symbol):
+    patch = tmp_path / "utils" / "vllm" / "npu_vllm_patch.py"
+    patch.parent.mkdir(parents=True)
+    patch.write_text("from vllm.model_executor.layers.fused_moe import FusedMoE" if references_legacy_symbol else "raise AssertionError('must not execute probe')", encoding="utf-8")
+    monkeypatch.setattr(compat.resources, "files", lambda _: tmp_path)
+    assert compat._needs_legacy_fused_moe_guard() is references_legacy_symbol
+
+
+@pytest.fixture
+def adapter_package(tmp_path, monkeypatch):
+    marker = tmp_path / "patches" / "megatron" / "nvrx_compat.py"
+    marker.parent.mkdir(parents=True)
+    marker.touch()
+    spec = types.SimpleNamespace(submodule_search_locations=[str(tmp_path)])
+    monkeypatch.setattr(compat.importlib.util, "find_spec", lambda name: spec)
+    return marker
+
+
 @pytest.mark.parametrize("native_version", [None, "0.6.0"])
-def test_npu_megatron_adapter_prepares_namespace_nvrx(monkeypatch, native_version):
+def test_npu_megatron_adapter_prepares_namespace_nvrx(monkeypatch, adapter_package, native_version):
     nvrx = types.ModuleType("nvidia_resiliency_ext")
     if native_version is not None:
         nvrx.__version__ = native_version
     calls = []
-    monkeypatch.setattr(compat, "_module_available", lambda name: name == "megatron_adaptor")
+
     def importer(name):
         calls.append(name)
         if name == "nvidia_resiliency_ext":
             return nvrx
         assert name == "megatron_adaptor"
         nvrx.__version__ = "adapter-owned-version"
+
     monkeypatch.setattr(compat.importlib, "import_module", importer)
     assert compat.install_npu_megatron_import_compat() is (native_version is None)
     assert nvrx.__version__ == (native_version or "adapter-owned-version")
     assert ("megatron_adaptor" in calls) is (native_version is None)
 
 
-def test_npu_megatron_adapter_skips_absent_optional_dependency(monkeypatch):
+def test_unrelated_adapter_is_not_imported(monkeypatch, adapter_package):
+    adapter_package.unlink()
+    monkeypatch.setattr(compat.importlib, "import_module", pytest.fail)
+    assert not compat.install_npu_megatron_import_compat()
+
+
+def test_npu_megatron_adapter_skips_absent_optional_dependency(monkeypatch, adapter_package):
     def missing(name):
-        raise ModuleNotFoundError(name)
+        raise ModuleNotFoundError(name, name=name)
+
     monkeypatch.setattr(compat.importlib, "import_module", missing)
-    assert compat.install_npu_megatron_import_compat() is False
+    assert not compat.install_npu_megatron_import_compat()
+
+
+def test_npu_megatron_adapter_reports_initialization_error(monkeypatch, adapter_package):
+    def broken(name):
+        if name == "nvidia_resiliency_ext":
+            return types.ModuleType(name)
+        raise ImportError("adapter dependency missing")
+
+    monkeypatch.setattr(compat.importlib, "import_module", broken)
+    with pytest.raises(RuntimeError, match="NPU online drafter") as err:
+        compat.install_npu_megatron_import_compat()
+    assert isinstance(err.value.__cause__, ImportError)

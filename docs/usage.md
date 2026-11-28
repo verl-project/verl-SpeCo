@@ -226,6 +226,12 @@ in a compatible recipe. Disable SGL hidden-state collection and old-logprob
 bypass. These collection requirements apply only to online drafter training.
 SpecOPD requires the 0.9 V1 sync trainer.
 
+On NPU, the vLLM import guard checks the installed verl patch for the legacy
+`FusedMoE` symbol so downstream trainer shims do not select the patch. Online
+drafter workers initialize MegatronAdaptor before receiving training RPCs when
+the installed adapter provides its NVRx compatibility patch and NVRx is missing
+its version attribute. This includes FSDP2 actors that pass Megatron objects.
+
 The V1 API probe covers 0.x release lines starting at 0.10 (including dev and
 RC builds). The tested baseline is verl
 `499cbe6d3a741de605c6aaf495c4bd13c1ac1fff` with TransferQueue 0.1.12.

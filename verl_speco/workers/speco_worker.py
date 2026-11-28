@@ -527,12 +527,6 @@ class SpecoWorker(Worker):
                 "SpecoWorker requires an explicit device_name from the trainer initialization path"
             )
         self.device_name = str(device_name).lower()
-        if self.device_name == "npu":
-            from verl_speco.integration.verl_npu_vllm_compat import (
-                install_npu_megatron_import_compat,
-            )
-
-            install_npu_megatron_import_compat()
         self.trainer: Any = None
         self.feature_writer: Optional[TorchShardFeatureStore] = None
         self.feature_writer_path: Optional[str] = None
@@ -743,6 +737,12 @@ class SpecoWorker(Worker):
     def init_model(self):
         if not self.enable_drafter:
             return
+        if self.device_name == "npu":
+            from verl_speco.integration.verl_npu_vllm_compat import (
+                install_npu_megatron_import_compat,
+            )
+
+            install_npu_megatron_import_compat()
 
         self._ensure_training_group_initialized()
         if not self.in_drafter_train_group:

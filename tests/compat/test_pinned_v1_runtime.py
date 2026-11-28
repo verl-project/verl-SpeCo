@@ -29,7 +29,7 @@ def test_real_v1_sync_config_and_shared_hooks(name, monkeypatch):
     from verl.trainer import main_ppo
     from verl.trainer.ppo.v1 import PPOTrainerSync
     from verl_speco import main
-    from verl_speco.integration import task_runner
+    from verl_speco.integration import task_runner, verl_npu_vllm_compat
     from verl_speco.trainer.v1.factory import get_speco_v1_trainer_cls
 
     with initialize_config_dir(
@@ -50,6 +50,7 @@ def test_real_v1_sync_config_and_shared_hooks(name, monkeypatch):
 
     def inspect_before_ray(config, task_runner_class):
         assert task_runner._VERL_TASK_RUNNER_API == "v1-only"
+        assert not verl_npu_vllm_compat._needs_legacy_fused_moe_guard()
         assert callable(task_runner_class.remote)
         assert config.trainer.use_v1 and config.transfer_queue.enable
         cls = get_speco_v1_trainer_cls("sync")
