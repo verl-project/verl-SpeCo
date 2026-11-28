@@ -588,6 +588,31 @@ actor_rollout_ref:
         dflash2_selector_rank: 256
         dflash2_selector_top_k: 16
         dflash2_selector_loss_weight: 1.0
+        # LiLiCorr (arXiv:2608.20530): DFlash backbone + candidate-lattice head
+        # that rescores the backbone's per-slot top-k. Geometry is config-driven;
+        # defaults follow the paper's main model (block 16, K=8, width 1024).
+        # The head geometry is not a user knob beyond these; keep the surface
+        # minimal. Serving requires enforce_eager + full vocab + greedy drafts.
+        lilicorr_block_size: 16
+        lilicorr_num_anchors: 512
+        lilicorr_loss_decay_gamma: 7.0
+        lilicorr_max_window: 3072
+        lilicorr_num_hidden_layers: 5
+        lilicorr_num_target_layers: 5
+        lilicorr_backbone_hidden_size: null
+        lilicorr_mask_token_id: null
+        lilicorr_target_layer_ids: null
+        lilicorr_candidate_topk: 8
+        lilicorr_head_hidden_size: 1024
+        lilicorr_factor_dim: 1024
+        lilicorr_num_layers: 2
+        lilicorr_num_heads: 8
+        lilicorr_mlp_ratio: 2.0
+        lilicorr_logit_scale: 8.0
+        lilicorr_vector_eps: 1.0e-4
+        lilicorr_w_ce: 0.25
+        lilicorr_w_pen: 0.25
+        lilicorr_loss_chunk_anchors: 128
         # EAGLE-1 / EAGLE-2 draft training (single-step feature regression +
         # full-vocab soft-CE distillation against the frozen target head).
         eagle1_num_hidden_layers: 1

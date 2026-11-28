@@ -14,7 +14,6 @@
 import json
 import os
 
-from typing import Union
 from transformers import AutoModelForCausalLM as AutoModelForCausalLMBase
 from transformers import (
     LlamaConfig,
@@ -24,7 +23,6 @@ from transformers import (
 
 from .dflash import DFlashConfig
 from .eagle.llama_eagle import LlamaForCausalLMEagle3
-
 
 _EAGLE3_ARCHITECTURE_ALIASES = {
     "LlamaForCausalLMEagle3",
@@ -48,6 +46,12 @@ _DOMINO_ARCHITECTURE_ALIASES = {
 _DFLASH2_ARCHITECTURE_ALIASES = {
     "DFlash2DraftModel",
     "Qwen3DFlash2Model",
+}
+
+_LILICORR_ARCHITECTURE_ALIASES = {
+    "LiLiCorrDraftModel",
+    "LiLiCorrSpeculator",
+    "Qwen3LiLiCorrModel",
 }
 
 
@@ -140,7 +144,7 @@ class AutoDraftModel(AutoModelForCausalLMBase):
     @classmethod
     def from_pretrained(
         cls,
-        pretrained_model_name_or_path: Union[str, os.PathLike[str]],
+        pretrained_model_name_or_path: str | os.PathLike[str],
         *model_args,
         **kwargs,
     ):
@@ -243,6 +247,7 @@ class AutoDraftModelConfig:
             and architecture not in _DSV4_DSPARK_ARCHITECTURE_ALIASES
             and architecture not in _DOMINO_ARCHITECTURE_ALIASES
             and architecture not in _DFLASH2_ARCHITECTURE_ALIASES
+            and architecture not in _LILICORR_ARCHITECTURE_ALIASES
         ):
             raise ValueError(f"Architecture {architecture} not supported")
 
@@ -278,6 +283,15 @@ class AutoDraftModelConfig:
             config["architectures"] = ["DFlash2DraftModel"]
         elif architecture in _EAGLE3_ARCHITECTURE_ALIASES:
             config = _normalize_eagle3_config_dict(config)
+        elif architecture in _LILICORR_ARCHITECTURE_ALIASES:
+            from .lilicorr import LiLiCorrConfig
+
+            config_class = LiLiCorrConfig
+            nested = config.get("dflash_config") or {}
+            for key, value in nested.items():
+                config.setdefault(key, value)
+            config["model_type"] = LiLiCorrConfig.model_type
+            config["architectures"] = ["LiLiCorrDraftModel"]
 
         if config_class is None:
             raise ValueError(f"Architecture {architecture} not supported")

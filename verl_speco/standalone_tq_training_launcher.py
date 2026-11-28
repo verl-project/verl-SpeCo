@@ -98,10 +98,18 @@ _DSPARK_CE_TARGET_SOURCE_KEY = (
 )
 _ALGORITHM_TARGET_LAYER_IDS_KEYS = {
     "EAGLE3": "actor_rollout_ref.rollout.drafter.training.eagle3_target_layer_ids",
+    "LILICORR": "actor_rollout_ref.rollout.drafter.training.lilicorr_target_layer_ids",
     "DFLASH": "actor_rollout_ref.rollout.drafter.training.dflash_target_layer_ids",
     "DSPARK": "actor_rollout_ref.rollout.drafter.training.dspark_target_layer_ids",
     "DSV4_DSPARK": "actor_rollout_ref.rollout.drafter.training.dsv4_dspark_target_layer_ids",
     "DOMINO": "actor_rollout_ref.rollout.drafter.training.domino_target_layer_ids",
+}
+_ALGORITHM_BLOCK_SIZE_KEYS = {
+    "LILICORR": "actor_rollout_ref.rollout.drafter.training.lilicorr_block_size",
+    "DSPARK": "actor_rollout_ref.rollout.drafter.training.dspark_block_size",
+    "DSV4_DSPARK": "actor_rollout_ref.rollout.drafter.training.dsv4_dspark_block_size",
+    "DOMINO": "actor_rollout_ref.rollout.drafter.training.domino_block_size",
+    "DFLASH2": "actor_rollout_ref.rollout.drafter.training.dflash2_block_size",
 }
 _MAX_STEPS_KEY = "actor_rollout_ref.rollout.drafter.training.max_steps"
 _BATCH_SIZE_PER_GPU_KEY = (
@@ -1127,6 +1135,14 @@ def build_pipeline_commands(
         + (
             _find_override(
                 training_args,
+                _ALGORITHM_BLOCK_SIZE_KEYS.get(
+                    config.algorithm,
+                    "actor_rollout_ref.rollout.drafter.training.dflash_block_size",
+                ),
+                normalize_key=True,
+            )
+            or _find_override(
+                training_args,
                 "actor_rollout_ref.rollout.drafter.training.dflash_block_size",
                 normalize_key=True,
             )
@@ -1519,7 +1535,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         finally:
             ray_session.close()
     except (OSError, RuntimeError, TimeoutError, ValueError) as exc:
-        logger.error("Standalone TQ training failed: %s", exc)
+        logger.exception("Standalone TQ training failed: %s", exc)
         return 2
 
 

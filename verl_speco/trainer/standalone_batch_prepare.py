@@ -52,12 +52,18 @@ def prepare_standalone_cpu_batch(
     )
     read_deadline = time.monotonic() + read_timeout
     algorithm = feature_contract.algorithm.upper()
-    if algorithm not in {"DSPARK", "DSV4_DSPARK", "DFLASH", "EAGLE3"} or (
-        feature_contract.use_logits
-    ):
+    if algorithm not in {
+        "DSPARK",
+        "DSV4_DSPARK",
+        "DFLASH",
+        "DFLASH2",
+        "DOMINO",
+        "LILICORR",
+        "EAGLE3",
+    } or (feature_contract.use_logits):
         raise ValueError(
-            "Reference prefetch supports DSPARK/DSV4_DSPARK/DFLASH/EAGLE3 hidden "
-            "supervision only"
+            "Reference prefetch supports DSPARK/DSV4_DSPARK/DFLASH/DFLASH2/"
+            "DOMINO/LILICORR/EAGLE3 hidden supervision only"
         )
     if not feature_contract.require_full_alignment:
         raise ValueError("Reference prefetch requires full feature alignment")
@@ -66,6 +72,11 @@ def prepare_standalone_cpu_batch(
         # DSV4-Flash DSpark shares the DSpark block-drafter context layouts.
         "DSV4_DSPARK": {"dflash_aux", "dflash_aux_plus_last"},
         "DFLASH": {"dflash_aux", "dflash_aux_plus_last"},
+        # LiLiCorr/DFlash2/Domino are DFlash variants (lattice/selector/prefix
+        # heads on the same aux(+final) supervision).
+        "DFLASH2": {"dflash_aux", "dflash_aux_plus_last"},
+        "DOMINO": {"dflash_aux", "dflash_aux_plus_last"},
+        "LILICORR": {"dflash_aux", "dflash_aux_plus_last"},
         "EAGLE3": {"eagle3_aux_plus_last"},
     }
     if feature_contract.hidden_states_layout not in valid_layouts[algorithm]:

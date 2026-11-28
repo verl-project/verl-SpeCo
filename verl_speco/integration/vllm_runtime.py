@@ -1224,6 +1224,69 @@ def _validate_vllm_dflash_drafter_config(
         )
 
 
+_LILICORR_SERVABLE_ARCHITECTURES = frozenset(
+    {"LiLiCorrDraftModel", "LiLiCorrSpeculator", "Qwen3LiLiCorrModel"}
+)
+
+
+def _validate_vllm_lilicorr_drafter_config(
+    spec_model_path: Any,
+    config: dict[str, Any] | None = None,
+    engine: str = "vLLM",
+    num_speculative_tokens: int | None = None,
+) -> None:
+    """Fail loud when a LiLiCorr checkpoint cannot be served.
+
+    vLLM's ``LiLiCorrForCausalLM`` dispatches on the architecture, requires the
+    full verifier vocabulary, and derives the lattice geometry from
+    ``dflash_config``. Serving also needs eager mode + greedy drafts, which the
+    caller enforces; this only checks the checkpoint contract.
+    """
+    if config is None:
+        config = _load_vllm_dflash_drafter_config(spec_model_path)
+    if config is None:
+        return
+    config_path = os.path.join(os.fspath(spec_model_path), "config.json")
+    architectures = config.get("architectures") or []
+    if _LILICORR_SERVABLE_ARCHITECTURES.isdisjoint(architectures):
+        raise ValueError(
+            f"{engine} LILICORR requires actor_rollout_ref.rollout.drafter.model_path "
+            "to point to a LiLiCorr drafter checkpoint with architectures in "
+            f"{sorted(_LILICORR_SERVABLE_ARCHITECTURES)}; got "
+            f"architectures={architectures!r} from {config_path}."
+        )
+    nested = config.get("dflash_config") or {}
+    block_size = _positive_int_or_none(
+        config.get("block_size", nested.get("block_size"))
+    )
+    if block_size is None:
+        raise ValueError(
+            f"{engine} LILICORR requires block_size in {config_path} (top level or "
+            "dflash_config)."
+        )
+    if num_speculative_tokens is not None and num_speculative_tokens != block_size - 1:
+        raise ValueError(
+            f"{engine} LILICORR requires spec_verify_tokens = block_size - 1 = "
+            f"{block_size - 1}; got {num_speculative_tokens}."
+        )
+    vocab_size = config.get("vocab_size")
+    draft_vocab = config.get("draft_vocab_size")
+    if vocab_size is not None and draft_vocab not in (None, vocab_size):
+        raise ValueError(
+            f"{engine} LILICORR requires the full verifier vocabulary; got "
+            f"draft_vocab_size={draft_vocab}, vocab_size={vocab_size} in "
+            f"{config_path}."
+        )
+    topk = config.get("lilicorr_candidate_topk", nested.get("lilicorr_candidate_topk"))
+    if topk is not None:
+        topk = int(topk)
+        if topk < 1 or topk > 16 or topk & (topk - 1):
+            raise ValueError(
+                f"{engine} LILICORR requires lilicorr_candidate_topk to be a power "
+                f"of two <= 16; got {topk} in {config_path}."
+            )
+
+
 def _load_env_drafter_config() -> dict[str, Any]:
     return _parse_env_drafter_config(get_drafter_config_env())
 
@@ -1730,6 +1793,14 @@ def _speculative_method_from_drafter(drafter_cfg: dict[str, Any]) -> str:
         # ``_validate_vllm_dflash_drafter_config`` and the engine capability by
         # ``_assert_vllm_supports_dflash2``.
         return "dflash"
+    if algorithm == "LILICORR":
+        # LiLiCorr is a DFlash variant, not an engine-level method: vLLM runs it
+        # through the DFlash proposer (method="dflash") and dispatches on the
+        # checkpoint architecture ``LiLiCorrDraftModel`` to
+        # ``vllm/v1/worker/gpu/spec_decode/lilicorr`` (the same shape DFlash2
+        # uses). LILICORR is never a valid method string. The engine requires
+        # enforce_eager, the full vocab and greedy drafts.
+        return "dflash"
     if algorithm == "DSPARK":
         # MRV1 served DSpark through a DFlash compatibility alias. MRV2 owns a
         # native DSpark speculator and must keep method=dspark so the Markov
@@ -1762,7 +1833,13 @@ def _should_force_eager(drafter_cfg: dict[str, Any]) -> bool:
         _get_nested(drafter_cfg, ("vllm", "force_eager"), None),
         _get_nested(drafter_cfg, ("training", "draft_update_enforce_eager"), None),
     )
-    return explicit is not None and bool(_bool_or_none(explicit))
+    if explicit is not None:
+        return bool(_bool_or_none(explicit))
+    if _drafter_algorithm(drafter_cfg) == "LILICORR" and _is_vllm_ascend_runtime_hint():
+        # vllm-ascend's LiLiCorr speculator raises on graph mode outright
+        # (worker/v2/spec_decode/lilicorr/speculator.py), so opt out by default.
+        return True
+    return False
 
 
 # Acceptance settings that break the exact target-distribution guarantee RL relies
@@ -1943,7 +2020,13 @@ def build_vllm_speculative_config_from_drafter(
                 f"must be positive for vLLM {method.upper()} speculative decoding"
             )
         drafter_checkpoint_config = _load_vllm_dflash_drafter_config(spec_model_path)
-        if method == "dflash" or algorithm == "DSPARK":
+        if algorithm == "LILICORR":
+            _validate_vllm_lilicorr_drafter_config(
+                spec_model_path,
+                config=drafter_checkpoint_config,
+                num_speculative_tokens=num_speculative_tokens,
+            )
+        elif method == "dflash" or algorithm == "DSPARK":
             _validate_vllm_dflash_drafter_config(
                 spec_model_path,
                 algorithm=algorithm,

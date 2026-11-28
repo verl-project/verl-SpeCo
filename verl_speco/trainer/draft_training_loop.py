@@ -207,8 +207,16 @@ async def _run_standalone_draft_training_async(
         )
         activated = await trainer.activate_training_model()
         if not activated:
+            err = getattr(trainer, "last_activation_error", None)
+            logger.error(
+                "[standalone rank=%s] activate_training_model returned False: "
+                "last_activation_error=%r",
+                rank,
+                err,
+            )
             raise RuntimeError(
-                f"Failed to activate standalone drafter trainer on rank={rank}"
+                f"Failed to activate standalone drafter trainer on rank={rank}: "
+                f"last_activation_error={err}"
             )
         logger.info(
             "[standalone rank=%s] drafter model activated elapsed=%.3fs",
@@ -1469,6 +1477,27 @@ _VARIANT_RUNTIME_ALIASES: dict[str, tuple[str, tuple[str, ...]]] = {
             "target_num_hidden_layers",
         ),
     ),
+    # LiLiCorr is served by vLLM's native lilicorr method; the head geometry
+    # travels in dflash_config so the released checkpoint layout matches.
+    "lilicorr": (
+        "dflash_config",
+        (
+            "block_size",
+            "num_anchors",
+            "loss_decay_gamma",
+            "mask_token_id",
+            "lilicorr_candidate_topk",
+            "lilicorr_hidden_size",
+            "lilicorr_factor_dim",
+            "lilicorr_num_layers",
+            "lilicorr_num_heads",
+            "lilicorr_mlp_ratio",
+            "lilicorr_logit_scale",
+            "lilicorr_vector_eps",
+            "sample_from_anchor",
+            "causal",
+        ),
+    ),
     # DFlash2 is served as a DFlash checkpoint whose dflash_config carries the
     # selector/conv hyperparameters, matching the released z-lab layout.
     "dflash2": (
@@ -1556,6 +1585,7 @@ _STANDALONE_TRAINING_LAYER_KEYS = {
     "dspark": "dspark_target_layer_ids",
     "dsv4_dspark": "dsv4_dspark_target_layer_ids",
     "domino": "domino_target_layer_ids",
+    "lilicorr": "lilicorr_target_layer_ids",
 }
 
 
@@ -1693,6 +1723,28 @@ def _sync_standalone_export_error(
     return failed
 
 
+def _training_block_size(trainer: DrafterBaseTrainer, backend_type: str) -> int | None:
+    training_cfg = getattr(
+        getattr(getattr(trainer, "config", None), "rollout", None), "drafter", None
+    )
+    training_cfg = getattr(training_cfg, "training", None)
+    if training_cfg is None:
+        return None
+    keys = (
+        f"{backend_type}_block_size",
+        "dflash_block_size",
+    )
+    for key in keys:
+        value = (
+            training_cfg.get(key, None)
+            if hasattr(training_cfg, "get")
+            else getattr(training_cfg, key, None)
+        )
+        if value is not None:
+            return int(value)
+    return None
+
+
 def _rewrite_standalone_block_runtime_config(
     trainer: DrafterBaseTrainer,
     checkpoint_path: str,
@@ -1705,7 +1757,14 @@ def _rewrite_standalone_block_runtime_config(
     contract and only merge the alias fields needed by vLLM/SGLang.
     """
     backend_type = getattr(getattr(trainer, "backend", None), "model_type", None)
-    if backend_type not in {"dflash", "dflash2", "dspark", "dsv4_dspark", "domino"}:
+    if backend_type not in {
+        "dflash",
+        "dflash2",
+        "dspark",
+        "dsv4_dspark",
+        "domino",
+        "lilicorr",
+    }:
         return
 
     if completed_future is not None:
@@ -1832,6 +1891,24 @@ def _rewrite_standalone_block_runtime_config(
         runtime_config["model_type"] = "qwen3"
         runtime_config["architectures"] = ["Qwen3DSparkModel"]
 
+    if backend_type in {"dflash", "dflash2"}:
+        # Match the released z-lab layout: target-family model_type (transformers
+        # AutoConfig cannot parse the training-only names) and a top-level
+        # block_size so serving can bound num_speculative_tokens.
+        runtime_config["model_type"] = "qwen3"
+        block_size = _training_block_size(trainer, backend_type)
+        if block_size is not None:
+            runtime_config["block_size"] = int(block_size)
+    if backend_type == "lilicorr":
+        # Match the released checkpoint layout: ``model_type`` stays the target
+        # family ("qwen3") so transformers AutoConfig can parse it, and vLLM
+        # dispatches to the lattice head from the architecture name. Keep the
+        # full verifier vocabulary (lilicorr cannot d2t).
+        runtime_config["model_type"] = "qwen3"
+        runtime_config["architectures"] = ["LiLiCorrDraftModel"]
+        runtime_config["draft_vocab_size"] = runtime_config.get(
+            "vocab_size", runtime_config.get("draft_vocab_size")
+        )
     runtime_config["speco_training_model_type"] = backend_type
     common_alias_keys = ("target_layer_ids", "mask_token_id", "num_context_layers")
     _fill_if_missing(runtime_config, training_config, common_alias_keys)
@@ -1904,7 +1981,14 @@ def _build_training_device_mesh(draft_config, world_size: int) -> DeviceMesh | N
 
 def _block_metric_prefix(trainer: DrafterBaseTrainer) -> str | None:
     model_type = str(getattr(getattr(trainer, "backend", None), "model_type", "") or "")
-    if model_type in {"dflash", "dspark", "eagle3", "dflash2", "dsv4_dspark"}:
+    if model_type in {
+        "dflash",
+        "dspark",
+        "eagle3",
+        "dflash2",
+        "dsv4_dspark",
+        "lilicorr",
+    }:
         return model_type
     return None
 
@@ -1965,7 +2049,7 @@ def _standalone_step_metrics(
     }
     prefix = _block_metric_prefix(trainer)
     if prefix is not None:
-        anchor_offset = 1 if prefix in {"dflash", "dflash2"} else 0
+        anchor_offset = 1 if prefix in {"dflash", "dflash2", "lilicorr"} else 0
         losses = _position_metric_series(raw_metrics, prefix, "loss_per_position")
         accuracies = _position_metric_series(
             raw_metrics, prefix, "accuracy_per_position"
@@ -1997,6 +2081,17 @@ def _standalone_step_metrics(
             metrics["train/top1_acc"] = float(raw_metrics[f"{prefix}/top1_acc"])
         if f"{prefix}/top5_acc" in raw_metrics:
             metrics["train/top5_acc"] = float(raw_metrics[f"{prefix}/top5_acc"])
+        for lilicorr_name in (
+            "lilicorr_ce",
+            "lilicorr_penalty",
+            "lilicorr_eal",
+            "lilicorr_top1_eal",
+            "lilicorr_oracle_eal",
+            "lilicorr_supervised_tokens",
+        ):
+            raw_key = f"{prefix}/{lilicorr_name}"
+            if raw_key in raw_metrics:
+                metrics[f"train/{lilicorr_name}"] = float(raw_metrics[raw_key])
         for idx, value in enumerate(pred_losses):
             metrics[f"train/ploss_{idx}"] = float(value)
         for idx, value in enumerate(pred_accuracies):
@@ -2022,6 +2117,12 @@ def _log_standalone_step_metrics(metrics: dict[str, float], *, rank: int) -> Non
         ("train/top1_acc", "top1"),
         ("train/top5_acc", "top5"),
         ("train/mean_accept_length", "mean_accept_length"),
+        ("train/lilicorr_ce", "lilicorr_ce"),
+        ("train/lilicorr_penalty", "lilicorr_penalty"),
+        ("train/lilicorr_eal", "lilicorr_eal"),
+        ("train/lilicorr_top1_eal", "lilicorr_top1_eal"),
+        ("train/lilicorr_oracle_eal", "lilicorr_oracle_eal"),
+        ("train/lilicorr_supervised_tokens", "lilicorr_sup_tokens"),
         ("train/lr", "lr"),
         ("perf/step_time", "step_time"),
         ("perf/loader_plan_wait_time", "loader_plan_wait_time"),
@@ -2341,8 +2442,15 @@ def _next_batch_across_ranks(
         timings["rank_ready_sync_time"] = time.perf_counter() - sync_started
     if any_failed:
         if local_error is not None:
+            logger.error(
+                "[standalone rank=%s] local batch error: %r",
+                rank,
+                local_error,
+                exc_info=local_error,
+            )
             raise RuntimeError(
-                f"Standalone target-feature producer failed on rank={rank}; "
+                f"Standalone target-feature producer failed on rank={rank}: "
+                f"{type(local_error).__name__}: {local_error}; "
                 "all ranks are stopping before the next training collective"
             ) from local_error
         raise RuntimeError(

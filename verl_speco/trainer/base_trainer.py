@@ -1237,7 +1237,14 @@ class DrafterBaseTrainer:
 
     def _block_drafter_metric_prefix(self) -> str:
         model_type = str(getattr(self.backend, "model_type", "dflash") or "dflash")
-        if model_type in {"dspark", "dsv4_dspark", "domino", "eagle3", "dflash2"}:
+        if model_type in {
+            "dspark",
+            "dsv4_dspark",
+            "domino",
+            "eagle3",
+            "dflash2",
+            "lilicorr",
+        }:
             return model_type
         return "dflash"
 
@@ -1342,6 +1349,30 @@ class DrafterBaseTrainer:
             metrics[f"{prefix}/selector_loss"] = (
                 sums[f"{prefix}/selector_loss_sum"] / selector_weight
             )
+        # LiLiCorr candidate-lattice head: CE/penalty are pooled scalars, the
+        # EAL triple is a block-weighted accepted length.
+        lilicorr_ce_total = sums.get(f"{prefix}/lilicorr_ce_total", 0.0)
+        if lilicorr_ce_total > 0:
+            metrics[f"{prefix}/lilicorr_ce"] = (
+                sums.get(f"{prefix}/lilicorr_ce_sum", 0.0) / lilicorr_ce_total
+            )
+            metrics[f"{prefix}/lilicorr_penalty"] = sums.get(
+                f"{prefix}/lilicorr_penalty_sum", 0.0
+            ) / max(sums.get(f"{prefix}/lilicorr_penalty_total", 0.0), 1e-12)
+        for lilicorr_name in (
+            "lilicorr_eal",
+            "lilicorr_top1_eal",
+            "lilicorr_oracle_eal",
+        ):
+            total = sums.get(f"{prefix}/{lilicorr_name}_total", 0.0)
+            if total > 0:
+                metrics[f"{prefix}/{lilicorr_name}"] = (
+                    sums.get(f"{prefix}/{lilicorr_name}_sum", 0.0) / total
+                )
+        if f"{prefix}/lilicorr_supervised_token_count" in sums:
+            metrics[f"{prefix}/lilicorr_supervised_tokens"] = sums[
+                f"{prefix}/lilicorr_supervised_token_count"
+            ]
         selector_tokens = sums.get(f"{prefix}/selector_token_count", 0.0)
         if selector_tokens > 0:
             metrics[f"{prefix}/selector_accuracy"] = (
@@ -1539,6 +1570,18 @@ class DrafterBaseTrainer:
             "masked_rows": f"{prefix}/masked_rows",
             "sampled_vocab_size": f"{prefix}/sampled_vocab_size",
             "loss_mode_id": f"{prefix}/loss_mode_id",
+            # LiLiCorr candidate-lattice head.
+            "lilicorr_ce_sum": f"{prefix}/lilicorr_ce_sum",
+            "lilicorr_ce_total": f"{prefix}/lilicorr_ce_total",
+            "lilicorr_penalty_sum": f"{prefix}/lilicorr_penalty_sum",
+            "lilicorr_penalty_total": f"{prefix}/lilicorr_penalty_total",
+            "lilicorr_eal_sum": f"{prefix}/lilicorr_eal_sum",
+            "lilicorr_eal_total": f"{prefix}/lilicorr_eal_total",
+            "lilicorr_top1_eal_sum": f"{prefix}/lilicorr_top1_eal_sum",
+            "lilicorr_top1_eal_total": f"{prefix}/lilicorr_top1_eal_total",
+            "lilicorr_oracle_eal_sum": f"{prefix}/lilicorr_oracle_eal_sum",
+            "lilicorr_oracle_eal_total": f"{prefix}/lilicorr_oracle_eal_total",
+            "lilicorr_supervised_token_count": f"{prefix}/lilicorr_supervised_token_count",
         }
         for key in (*_VAT_METRIC_KEYS, "batch_count"):
             scalar_keys[f"vat/{key}"] = f"{prefix}/vat/{key}"
@@ -1616,6 +1659,27 @@ class DrafterBaseTrainer:
                     strict=False,
                 )
             ],
+            # LiLiCorr candidate-lattice head: the *_sum entries are already
+            # pooled scalars (total == 1), the EAL triple is sum/total so the
+            # ratio is the block-weighted accepted length.
+            "lilicorr_ce": scalar("lilicorr_ce_sum"),
+            "lilicorr_penalty": scalar("lilicorr_penalty_sum"),
+            "lilicorr_eal": (
+                scalar("lilicorr_eal_sum") / scalar("lilicorr_eal_total")
+                if scalar("lilicorr_eal_total") > 0
+                else float("nan")
+            ),
+            "lilicorr_top1_eal": (
+                scalar("lilicorr_top1_eal_sum") / scalar("lilicorr_top1_eal_total")
+                if scalar("lilicorr_top1_eal_total") > 0
+                else float("nan")
+            ),
+            "lilicorr_oracle_eal": (
+                scalar("lilicorr_oracle_eal_sum") / scalar("lilicorr_oracle_eal_total")
+                if scalar("lilicorr_oracle_eal_total") > 0
+                else float("nan")
+            ),
+            "lilicorr_supervised_tokens": scalar("lilicorr_supervised_token_count"),
         }
 
     def _record_dflash_training_metrics(
@@ -2020,6 +2084,14 @@ class DrafterBaseTrainer:
             drafter_train_config["_resume_optimizer_steps"] = resume_optimizer_steps
 
         self.optimizer = self.backend.setup_optimizer(self.model, drafter_train_config)
+        # Capture the configured LR before the optimizer checkpoint restore
+        # overwrites param_groups["lr"] with the checkpointed value. The LR
+        # scheduler's base_lrs must be built from the *configured* base, not
+        # from the restored value, otherwise every resumed step runs at a
+        # wrongly-scaled LR (observed as min_lr_ratio * base).
+        configured_base_lrs = [
+            float(param_group["lr"]) for param_group in self.optimizer.param_groups
+        ]
         restored_trainer_state = None
         restored_optimizer_lrs = None
         if resume_enabled and resume_metadata.get("optimizer") is not None:
@@ -2035,9 +2107,24 @@ class DrafterBaseTrainer:
         if restored_trainer_state is not None:
             scheduler_state = restored_trainer_state.get("lr_scheduler")
             if self.lr_scheduler is not None and isinstance(scheduler_state, dict):
-                self.lr_scheduler.load_state_dict(scheduler_state)
+                # Restore only the epoch counter. torch's full load_state_dict
+                # would also clobber this fresh scheduler's hyperparameters
+                # (decay_steps/warmup/min_lr_ratio) with whatever schedule the
+                # checkpoint was saved under -- e.g. a legacy lr_decay_steps=100
+                # run would pin every resumed step to min_lr forever.
+                if "last_epoch" in scheduler_state:
+                    self.lr_scheduler.last_epoch = int(scheduler_state["last_epoch"])
+                if "_step_count" in scheduler_state:
+                    self.lr_scheduler._step_count = (
+                        int(scheduler_state["_step_count"]) + 1
+                    )
+                for param_group, base_lr in zip(
+                    self.optimizer.param_groups, configured_base_lrs, strict=True
+                ):
+                    param_group["initial_lr"] = base_lr
+                self.lr_scheduler.base_lrs = list(configured_base_lrs)
                 restored_optimizer_lrs = [
-                    float(lr) for lr in self.lr_scheduler.get_last_lr()
+                    float(lr) for lr in self.lr_scheduler.get_lr()
                 ]
             if restored_optimizer_lrs is not None:
                 if len(restored_optimizer_lrs) != len(self.optimizer.param_groups):
