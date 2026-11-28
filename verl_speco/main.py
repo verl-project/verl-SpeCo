@@ -22,6 +22,7 @@ distribution aligned with verl.
 
 import inspect
 import json
+import logging
 import os
 
 import hydra
@@ -334,7 +335,7 @@ def run(config) -> None:
     from verl.trainer import main_ppo
     from verl.utils.device import auto_set_device
 
-    from verl_speco.integration.compat import check_compatible_verl
+    from verl_speco.integration.compat import check_compatible_verl, has_only_v1_runner
 
     check_compatible_verl()
     auto_set_device(config)
@@ -344,7 +345,22 @@ def run(config) -> None:
         # runner.  Apply it only where upstream still defines the migration.
         config = migrate_legacy_reward_impl(config)
 
-    if should_bypass_speco(config):
+    bypass = should_bypass_speco(config)
+    if has_only_v1_runner(main_ppo):
+        from omegaconf import OmegaConf
+
+        # Older recipes explicitly disable both. run_ppo reads the queue flag
+        # while building the Ray environment, before the task runner starts.
+        if not _config_get(config, "trainer", "use_v1") or not _config_get(
+            config, "transfer_queue", "enable"
+        ):
+            logging.getLogger(__name__).warning(
+                "Detected V1-only verl; enabling trainer.use_v1 and transfer_queue.enable before Ray initialization"
+            )
+        OmegaConf.update(config, "trainer.use_v1", True, force_add=True)
+        OmegaConf.update(config, "transfer_queue.enable", True, force_add=True)
+
+    if bypass:
         # Native verl path: keep SPECO runtime/compat patches unloaded so the
         # actor -> rollout weight sync matches verl exactly.  verl selects its
         # own TaskRunner (legacy on 0.8, legacy or V1 on 0.9).

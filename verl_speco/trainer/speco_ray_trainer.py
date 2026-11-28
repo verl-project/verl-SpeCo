@@ -34,7 +34,6 @@ import torch
 from omegaconf import open_dict
 from verl import DataProto
 from verl.single_controller.ray import RayClassWithInitArgs
-from verl.trainer.ppo.ray_trainer import RayPPOTrainer
 from verl.trainer.ppo.utils import Role
 from verl.utils import tensordict_utils as tu
 from verl.workers.utils.padding import left_right_2_no_padding, no_padding_2_padding
@@ -138,6 +137,18 @@ from verl_speco.workers import SpecoWorker
 
 
 from verl_speco.integration.verify_trace import TRACE_KEY
+
+try:
+    from verl.trainer.ppo.ray_trainer import RayPPOTrainer
+except ModuleNotFoundError as exc:
+    if exc.name != "verl.trainer.ppo.ray_trainer":
+        raise
+
+    class RayPPOTrainer:
+        """V1 binds shared hook methods without constructing a legacy trainer."""
+
+        def __init__(self, *args, **kwargs):
+            raise RuntimeError("The installed verl only supports the V1 training path")
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))

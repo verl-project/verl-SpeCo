@@ -37,7 +37,7 @@ def _trainer_types() -> dict[str, Type]:
         )
     except ImportError as exc:  # pragma: no cover - exercised in dependency checks
         raise RuntimeError(
-            "SPECO V1 support requires verl release/v0.9.0 with verl.trainer.ppo.v1"
+            "SPECO V1 requires the sync, colocate_async and separate_async trainers in verl.trainer.ppo.v1"
         ) from exc
 
     class SpecoV1SyncTrainer(SpecoV1Mixin, PPOTrainerSync):

@@ -2355,9 +2355,17 @@ class SpecoV1Mixin(V1BubbleMixin):
                 if self._speco_freeze_policy is None:
                     raise RuntimeError("V1 async freeze requires an initialized policy")
                 if self._speco_freeze_branch_config().get("enabled", False):
-                    from verl.trainer.ppo.v1.trainer_base import _tq_supports_checkpoint
+                    from verl.trainer.ppo.v1 import trainer_base
 
-                    if not _tq_supports_checkpoint():
+                    check = getattr(trainer_base, "_tq_supports_checkpoint", None)
+                    if check is None:
+                        # V1-only verl calls these APIs directly.
+                        import transfer_queue as tq
+
+                        supported = all(callable(getattr(tq, op, None)) for op in ("save_checkpoint", "load_checkpoint"))
+                    else:
+                        supported = check()
+                    if not supported:
                         raise RuntimeError(
                             "V1 async freeze branch requires TransferQueue checkpoint/reissue support"
                         )

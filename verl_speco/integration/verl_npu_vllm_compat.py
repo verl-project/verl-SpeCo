@@ -91,6 +91,12 @@ def _uses_verl_v090_runner() -> bool:
     return _module_available("verl.trainer.main_ppo_v0")
 
 
+def _uses_v1_only_trainer() -> bool:
+    return _module_available("verl.trainer.ppo.v1") and not _module_available(
+        "verl.trainer.ppo.ray_trainer"
+    )
+
+
 def _install_verl_v080_npu_vllm_import_compat(
     module_importer: Callable[[str], Any],
 ) -> bool:
@@ -178,6 +184,10 @@ def install_verl_npu_vllm_import_compat(
     ):
         return False
     if not _module_available("torch_npu"):
+        return False
+    if _uses_v1_only_trainer():
+        # This layout applies its own NPU patches in verl.utils.vllm.
+        # The old temporary FusedMoE exports belong to the legacy runner.
         return False
 
     runner_api = "0.9" if _uses_verl_v090_runner() else "0.8"

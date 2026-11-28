@@ -13,18 +13,18 @@
 # limitations under the License.
 """Compatibility checks for the import-only verl dependency.
 
-verl-SpeCo keeps the existing ``release/v0.8.0`` integration as its default
-and additionally supports the moved legacy-runner API in ``release/v0.9.0``.
-Each release is checked against its own API contract; an environment never has
-to expose both sets of upstream modules at the same time.
+Release 0.8 and 0.9 use legacy runners. The V1-only layout in 0.10 and later has its
+own API contract and does not export the legacy PPO trainer.
 """
 
 from __future__ import annotations
 
 import importlib
+import importlib.util
 import json
 import logging
 import os
+import sys
 from collections.abc import Sequence
 from dataclasses import dataclass
 from importlib import metadata
@@ -33,11 +33,11 @@ from packaging.version import InvalidVersion, Version
 
 SUPPORTED_VERL_VERSION = "0.8.0"
 SUPPORTED_VERL_BRANCH = "release/v0.8.0"
-SUPPORTED_VERL_VERSIONS = ("0.8.0", "0.9.0")
+V1_MIN_VERSION = Version("0.10")
+V1_VERSION_RANGE = f">={V1_MIN_VERSION}"
+SUPPORTED_VERL_VERSIONS = ("0.8.0", "0.9.0", V1_VERSION_RANGE)
 SUPPORTED_VERL_BRANCHES = ("release/v0.8.0", "release/v0.9.0")
-SUPPORTED_VERL_RELEASES = dict(
-    zip(SUPPORTED_VERL_VERSIONS, SUPPORTED_VERL_BRANCHES, strict=True)
-)
+SUPPORTED_VERL_RELEASES = {"0.8.0": "release/v0.8.0", "0.9.0": "release/v0.9.0"}
 ALLOW_UNSUPPORTED_ENV = "VERL_SPECO_ALLOW_UNSUPPORTED_VERL"
 STRICT_COMPAT_ENV = "VERL_SPECO_STRICT_VERL"
 
@@ -46,7 +46,6 @@ logger = logging.getLogger(__name__)
 # These are the APIs imported by the core SPECO runner and trainer. Optional
 # vLLM/SGLang APIs are checked when their corresponding rollout is enabled.
 COMMON_REQUIRED_VERL_API: tuple[tuple[str, tuple[str, ...]], ...] = (
-    ("verl.trainer.ppo.ray_trainer", ("RayPPOTrainer",)),
     ("verl.trainer.ppo.utils", ("Role", "need_critic", "need_reference_policy")),
     (
         "verl.utils.device",
@@ -90,6 +89,7 @@ COMMON_REQUIRED_VERL_API: tuple[tuple[str, tuple[str, ...]], ...] = (
 REQUIRED_VERL_API_BY_RELEASE: dict[str, tuple[tuple[str, tuple[str, ...]], ...]] = {
     "0.8.0": COMMON_REQUIRED_VERL_API
     + (
+        ("verl.trainer.ppo.ray_trainer", ("RayPPOTrainer",)),
         (
             "verl.trainer.main_ppo",
             (
@@ -104,6 +104,7 @@ REQUIRED_VERL_API_BY_RELEASE: dict[str, tuple[tuple[str, tuple[str, ...]], ...]]
     ),
     "0.9.0": COMMON_REQUIRED_VERL_API
     + (
+        ("verl.trainer.ppo.ray_trainer", ("RayPPOTrainer",)),
         ("verl.trainer.main_ppo", ("run_ppo",)),
         ("verl.trainer.main_ppo_v0", ("BaseTaskRunner",)),
         (
@@ -112,6 +113,15 @@ REQUIRED_VERL_API_BY_RELEASE: dict[str, tuple[tuple[str, tuple[str, ...]], ...]]
         ),
         ("verl.utils.config", ("omega_conf_to_dataclass", "validate_config")),
         ("verl.workers.config.model", ("HFModelConfig",)),
+    ),
+    V1_VERSION_RANGE: COMMON_REQUIRED_VERL_API
+    + (
+        ("verl.trainer.main_ppo", ("TaskRunnerV1", "run_ppo")),
+        (
+            "verl.trainer.ppo.v1",
+            ("PPOTrainerSync", "PPOTrainerColocateAsync", "PPOTrainerSeparateAsync", "AgentLoopManagerTQ"),
+        ),
+        ("verl.utils.config", ("omega_conf_to_dataclass", "validate_config")),
     ),
 }
 
@@ -210,14 +220,27 @@ def _missing_required_api(
 
 
 def _version_matches_release(version: str | None, allowed_version: str) -> bool:
-    """Accept PEP 440 builds whose base version matches the supported release."""
+    """Match the release line, including its development and prerelease builds."""
 
     if version is None:
         return False
     try:
-        return Version(version).base_version == Version(allowed_version).base_version
+        parsed = Version(version)
+        if allowed_version == V1_VERSION_RANGE:
+            return Version(parsed.base_version) >= V1_MIN_VERSION
+        return parsed.base_version == Version(allowed_version).base_version
     except InvalidVersion:
         return False
+
+
+def has_only_v1_runner(main_ppo) -> bool:
+    """0.9 also exports TaskRunnerV1, but still has a separate V0 module."""
+    if not hasattr(main_ppo, "TaskRunnerV1") or hasattr(main_ppo, "TaskRunner"):
+        return False
+    v0_module = "verl.trainer.main_ppo_v0"
+    if v0_module in sys.modules:
+        return sys.modules[v0_module] is None
+    return importlib.util.find_spec(v0_module) is None
 
 
 def resolve_verl_compatibility(
@@ -232,7 +255,7 @@ def resolve_verl_compatibility(
         (
             allowed_version
             for allowed_version in allowed_versions
-            if allowed_version in SUPPORTED_VERL_RELEASES
+            if allowed_version in REQUIRED_VERL_API_BY_RELEASE
             and _version_matches_release(version, allowed_version)
         ),
         None,
@@ -241,19 +264,27 @@ def resolve_verl_compatibility(
         (
             allowed_version
             for allowed_version in allowed_versions
-            if SUPPORTED_VERL_RELEASES.get(allowed_version) == requested_revision
+            if allowed_version in SUPPORTED_VERL_RELEASES
+            and SUPPORTED_VERL_RELEASES[allowed_version] == requested_revision
         ),
         None,
     )
+    # Editable installs can retain old VCS metadata after the checkout changes.
     release_version = matched_branch_version or matched_version
+    if matched_version == V1_VERSION_RANGE:
+        release_version = matched_version
     missing_api = (
         _missing_required_api(release_version) if release_version is not None else ()
     )
 
     if release_version is not None and not missing_api:
+        if release_version == V1_VERSION_RANGE:
+            return VerlCompatibility(
+                version, commit_id, requested_revision, True, "matched verl >=0.10 V1 API contract"
+            )
         release_branch = SUPPORTED_VERL_RELEASES[release_version]
         reason = f"matched {release_branch} version/API contract"
-        if matched_branch_version is not None:
+        if matched_branch_version == release_version:
             reason = f"matched {release_branch} branch/API contract"
         return VerlCompatibility(version, commit_id, requested_revision, True, reason)
 
@@ -293,14 +324,14 @@ def _env_flag_enabled(name: str) -> bool:
 
 
 def check_compatible_verl(strict: bool | None = None) -> VerlCompatibility:
-    """Warn by default when verl is outside either supported API contract."""
+    """Warn by default when verl is outside the supported API contracts."""
 
     result = resolve_verl_compatibility()
     if result.supported:
         return result
 
     message = (
-        "SPECO requires import-only verl release/v0.8.0 or release/v0.9.0; "
+        "SPECO requires verl release/v0.8.0, release/v0.9.0, or verl >=0.10 with the V1 API; "
         f"found version={result.version!r}, requested_revision={result.requested_revision!r}, "
         f"commit_id={result.commit_id!r}: {result.reason}. "
         f"Set {STRICT_COMPAT_ENV}=1 to fail closed."

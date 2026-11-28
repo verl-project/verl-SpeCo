@@ -83,7 +83,7 @@ def test_overlay_has_expected_default_drafter_shape() -> None:
 
     assert raw.speco.verl_base.version == "0.8.0"
     assert raw.speco.verl_base.branch == "release/v0.8.0"
-    assert list(raw.speco.verl_base.supported_versions) == ["0.8.0", "0.9.0"]
+    assert list(raw.speco.verl_base.supported_versions) == ["0.8.0", "0.9.0", ">=0.10"]
     assert list(raw.speco.verl_base.supported_branches) == [
         "release/v0.8.0",
         "release/v0.9.0",

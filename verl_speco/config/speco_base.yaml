@@ -17,7 +17,7 @@ speco:
   verl_base:
     version: "0.8.0"
     branch: release/v0.8.0
-    supported_versions: ["0.8.0", "0.9.0"]
+    supported_versions: ["0.8.0", "0.9.0", ">=0.10"]
     supported_branches: [release/v0.8.0, release/v0.9.0]
     source_modifications_allowed: false
 

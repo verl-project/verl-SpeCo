@@ -30,13 +30,22 @@ from verl_speco.integration.opd_cotrain import validate_sync_opd_cotrain_config
 
 try:
     from verl.trainer.main_ppo_v0 import BaseTaskRunner as _TaskRunnerBase
-except ImportError:
-    # verl 0.8 exposes the legacy runner directly from main_ppo.  Keep this
-    # import isolated from the 0.9-only module so importing verl-SpeCo does not
-    # require both release APIs to exist in the same environment.
-    from verl.trainer.main_ppo import TaskRunner as _TaskRunnerBase
+except ModuleNotFoundError as exc:
+    if exc.name != "verl.trainer.main_ppo_v0":
+        raise
+    from verl.trainer import main_ppo
 
-    _VERL_TASK_RUNNER_API = "0.8"
+    if hasattr(main_ppo, "TaskRunner"):
+        from verl.trainer.main_ppo import TaskRunner as _TaskRunnerBase
+
+        _VERL_TASK_RUNNER_API = "0.8"
+    elif hasattr(main_ppo, "TaskRunnerV1"):
+        # TaskRunnerV1 is already a Ray actor. SpeCo wraps its own driver
+        # exactly once and delegates training to the upstream V1 trainer.
+        _TaskRunnerBase = object
+        _VERL_TASK_RUNNER_API = "v1-only"
+    else:
+        raise ImportError("verl exposes no supported PPO task runner") from exc
 else:
     _VERL_TASK_RUNNER_API = "0.9"
 
@@ -93,12 +102,7 @@ def _install_vllm_import_compat_for_task_runner(config) -> bool:
 
 
 class SpecoTaskRunner(_TaskRunnerBase):
-    """External TaskRunner that swaps in SpecoRayPPOTrainer.
-
-    The upstream runner moved from ``main_ppo.TaskRunner`` in verl 0.8 to
-    ``main_ppo_v0.BaseTaskRunner`` in verl 0.9.  The shared SPECO hooks are the
-    same, while dataset/model construction is selected below per release.
-    """
+    """Run SpeCo with the installed legacy or V1 PPO trainer."""
 
     def add_actor_rollout_worker(self, config):
         worker_cls, ray_worker_group_cls = super().add_actor_rollout_worker(config)
@@ -189,7 +193,9 @@ class SpecoTaskRunner(_TaskRunnerBase):
             if hasattr(trainer_config, "get")
             else getattr(trainer_config, "use_v1", False)
         )
-        if _VERL_TASK_RUNNER_API == "0.9" and bool(use_v1):
+        if _VERL_TASK_RUNNER_API == "v1-only" or (
+            _VERL_TASK_RUNNER_API == "0.9" and bool(use_v1)
+        ):
             # Install this in the task-runner process before V1 creates its
             # LLMServerManager and Ray workers, just as the legacy path does.
             _install_vllm_import_compat_for_task_runner(config)
@@ -228,8 +234,8 @@ class SpecoTaskRunner(_TaskRunnerBase):
         not replace the V1 agent-loop manager; this is important for a later
         Uni-Agent integration.
         """
-        if _VERL_TASK_RUNNER_API != "0.9":
-            raise RuntimeError("trainer.use_v1 requires verl release/v0.9.0")
+        if _VERL_TASK_RUNNER_API == "0.8":
+            raise RuntimeError("trainer.use_v1 requires a verl V1 trainer")
 
         import transfer_queue as tq
         from pprint import pprint
@@ -291,15 +297,20 @@ class SpecoTaskRunner(_TaskRunnerBase):
             succeeded = True
         finally:
             try:
-                tracking = getattr(trainer, "logger", None)
-                if tracking is not None:
-                    logger.info("Finishing SPECO V1 tracking")
-                    tracking.finish(exit_code=0 if succeeded else 1)
-                    logger.info("Finished SPECO V1 tracking")
+                close_dataloaders = getattr(trainer, "close_dataloaders", None)
+                if close_dataloaders is not None:
+                    close_dataloaders()
             finally:
-                logger.info("Closing SPECO V1 TransferQueue")
-                tq.close()
-                logger.info("Closed SPECO V1 TransferQueue")
+                try:
+                    tracking = getattr(trainer, "logger", None)
+                    if tracking is not None:
+                        logger.info("Finishing SPECO V1 tracking")
+                        tracking.finish(exit_code=0 if succeeded else 1)
+                        logger.info("Finished SPECO V1 tracking")
+                finally:
+                    logger.info("Closing SPECO V1 TransferQueue")
+                    tq.close()
+                    logger.info("Closed SPECO V1 TransferQueue")
 
     def _run_with_speco_trainer(self, config):
         from verl.utils.dataset.rl_dataset import collate_fn

@@ -22,6 +22,18 @@ import pytest
 from verl_speco.integration import verl_npu_vllm_compat as compat
 
 
+@pytest.fixture(autouse=True)
+def _legacy_layout(monkeypatch):
+    monkeypatch.setattr(compat, "_uses_v1_only_trainer", lambda: False)
+
+
+def test_v1_only_leaves_native_npu_patch_to_verl(monkeypatch):
+    monkeypatch.setitem(sys.modules, "torch_npu", types.ModuleType("torch_npu"))
+    monkeypatch.setattr(compat, "_IMPORT_COMPAT_APPLIED", False)
+    monkeypatch.setattr(compat, "_uses_v1_only_trainer", lambda: True)
+    assert compat.install_verl_npu_vllm_import_compat(pytest.fail) is False
+
+
 def test_v080_npu_patch_temporarily_adds_factory_weight_loader(monkeypatch) -> None:
     vllm = types.ModuleType("vllm")
     vllm.__version__ = "0.23.0"
